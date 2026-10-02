@@ -21,7 +21,6 @@ package render
 import (
 	"context"
 	"strings"
-	"time"
 
 	fnv1 "github.com/crossplane/function-sdk-go/proto/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -105,14 +104,16 @@ func (fa *FunctionAddresses) Addresses() map[string]string {
 	return fa.addrs
 }
 
-// Stop all function runtimes.
+// Stop all function runtimes. Every runtime is stopped even if some fail; the
+// returned error joins all failures. Each runtime bounds its own cleanup.
 func (fa *FunctionAddresses) Stop(ctx context.Context) error {
+	var errs []error
 	for name, rctx := range fa.contexts {
 		if err := rctx.Stop(ctx); err != nil {
-			return errors.Wrapf(err, "cannot stop function %q runtime (target %q)", name, rctx.Target)
+			errs = append(errs, errors.Wrapf(err, "cannot stop function %q runtime (target %q)", name, rctx.Target))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // StartFunctionRuntimes starts the runtime for each function and returns their
@@ -167,16 +168,14 @@ func injectNetworkAnnotation(fns []pkgv1.Function, networkName string) {
 	}
 }
 
-// StopFunctionRuntimes stops all function runtimes with a timeout.
-func StopFunctionRuntimes(log logging.Logger, fa *FunctionAddresses) {
+// StopFunctionRuntimes stops all function runtimes and returns all failures
+// joined. Cleanup runs even if ctx is already cancelled, so it can follow an
+// interrupted render. Each runtime bounds its own cleanup.
+func StopFunctionRuntimes(ctx context.Context, fa *FunctionAddresses) error {
 	if fa == nil {
-		return
+		return nil
 	}
-	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := fa.Stop(stopCtx); err != nil {
-		log.Info("Error stopping function runtimes", "error", err)
-	}
+	return fa.Stop(context.WithoutCancel(ctx))
 }
 
 // OverrideFunctionAnnotations applies annotation overrides from flags to
