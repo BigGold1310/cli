@@ -22,6 +22,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
@@ -132,6 +133,36 @@ func TestStartAndAttach(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.err, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("%s\nstartAndAttach(...): -want error, +got error:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestRunWithLabels(t *testing.T) {
+	cases := map[string]struct {
+		reason   string
+		existing map[string]string
+		labels   map[string]string
+		want     map[string]string
+	}{
+		"NilLabels": {
+			reason: "Labels should be set when the container config has none.",
+			labels: map[string]string{"a": "1"},
+			want:   map[string]string{"a": "1"},
+		},
+		"MergeLabels": {
+			reason:   "Labels should be merged into existing labels.",
+			existing: map[string]string{"a": "1"},
+			labels:   map[string]string{"b": "2"},
+			want:     map[string]string{"a": "1", "b": "2"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg := &runContainerConfig{containerConfig: &container.Config{Labels: tc.existing}}
+			RunWithLabels(tc.labels)(cfg)
+			if diff := cmp.Diff(tc.want, cfg.containerConfig.Labels); diff != "" {
+				t.Errorf("\n%s\nRunWithLabels(...): -want, +got:\n%s", tc.reason, diff)
 			}
 		})
 	}
