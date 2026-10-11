@@ -154,6 +154,57 @@ type packageImage struct {
 	Path string
 }
 
+// pushSingle annotates, digests and pushes one package image by digest reference.
+func pushSingle(ctx context.Context, adds *[]mutate.IndexAddendum, i int, pi packageImage, tag name.Tag, annotations map[string]string, logger logging.Logger, options ...remote.Option) error {
+	img, err := xpkg.AnnotateLayers(pi.Image)
+	if err != nil {
+		return errors.Wrapf(err, errAnnotateLayers)
+	}
+
+	img = annotateImage(img, annotations)
+
+	d, err := img.Digest()
+	if err != nil {
+		return errors.Wrapf(err, errFmtGetDigest, pi.Path)
+	}
+
+	n := fmt.Sprintf("%s@%s", tag.Repository.Name(), d.String())
+
+	ref, err := name.NewDigest(n, name.StrictValidation)
+	if err != nil {
+		return errors.Wrapf(err, errFmtNewDigest, n, pi.Path)
+	}
+
+	mt, err := img.MediaType()
+	if err != nil {
+		return errors.Wrapf(err, errFmtGetMediaType, pi.Path)
+	}
+
+	conf, err := img.ConfigFile()
+	if err != nil {
+		return errors.Wrapf(err, errFmtGetConfigFile, pi.Path)
+	}
+
+	(*adds)[i] = mutate.IndexAddendum{
+		Add: img,
+		Descriptor: v1.Descriptor{
+			MediaType: mt,
+			Platform: &v1.Platform{
+				Architecture: conf.Architecture,
+				OS:           conf.OS,
+				OSVersion:    conf.OSVersion,
+			},
+		},
+	}
+	if err := remote.Write(ref, img, append(options, remote.WithContext(ctx))...); err != nil {
+		return errors.Wrapf(err, errFmtPushPackage, pi.Path)
+	}
+
+	logger.Debug("Pushed package", "path", pi.Path, "ref", ref.String())
+
+	return nil
+}
+
 // pushImages pushes package images to the given URL using the provided options.
 func pushImages(logger logging.Logger, sp terminal.SpinnerPrinter, images []packageImage, url string, annotations map[string]string, options ...remote.Option) error {
 	if len(options) == 0 {
@@ -202,53 +253,7 @@ func pushImages(logger logging.Logger, sp terminal.SpinnerPrinter, images []pack
 	g, ctx := errgroup.WithContext(context.Background())
 	for i, pi := range images {
 		g.Go(func() error {
-			img, err := xpkg.AnnotateLayers(pi.Image)
-			if err != nil {
-				return errors.Wrapf(err, errAnnotateLayers)
-			}
-
-			img = annotateImage(img, annotations)
-
-			d, err := img.Digest()
-			if err != nil {
-				return errors.Wrapf(err, errFmtGetDigest, pi.Path)
-			}
-
-			n := fmt.Sprintf("%s@%s", tag.Repository.Name(), d.String())
-
-			ref, err := name.NewDigest(n, name.StrictValidation)
-			if err != nil {
-				return errors.Wrapf(err, errFmtNewDigest, n, pi.Path)
-			}
-
-			mt, err := img.MediaType()
-			if err != nil {
-				return errors.Wrapf(err, errFmtGetMediaType, pi.Path)
-			}
-
-			conf, err := img.ConfigFile()
-			if err != nil {
-				return errors.Wrapf(err, errFmtGetConfigFile, pi.Path)
-			}
-
-			adds[i] = mutate.IndexAddendum{
-				Add: img,
-				Descriptor: v1.Descriptor{
-					MediaType: mt,
-					Platform: &v1.Platform{
-						Architecture: conf.Architecture,
-						OS:           conf.OS,
-						OSVersion:    conf.OSVersion,
-					},
-				},
-			}
-			if err := remote.Write(ref, img, append(options, remote.WithContext(ctx))...); err != nil {
-				return errors.Wrapf(err, errFmtPushPackage, pi.Path)
-			}
-
-			logger.Debug("Pushed package", "path", pi.Path, "ref", ref.String())
-
-			return nil
+			return pushSingle(ctx, &adds, i, pi, tag, annotations, logger, options...)
 		})
 	}
 
