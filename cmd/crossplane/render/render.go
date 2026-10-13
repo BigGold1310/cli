@@ -97,8 +97,18 @@ type OperationOutputs struct {
 
 // FunctionAddresses maps function names to their gRPC target addresses.
 type FunctionAddresses struct {
-	addrs    map[string]string
-	contexts map[string]RuntimeContext
+	addrs map[string]string
+	// runtimes holds every runtime started, in start order. It's a slice
+	// rather than a map keyed by name so that Functions sharing a name all
+	// get stopped, even though only the last one's address is used.
+	runtimes []startedRuntime
+}
+
+// startedRuntime is a started runtime and the name of its Function.
+type startedRuntime struct {
+	RuntimeContext
+
+	name string
 }
 
 // Addresses returns the function name to gRPC address map.
@@ -110,9 +120,9 @@ func (fa *FunctionAddresses) Addresses() map[string]string {
 // returned error joins all failures. Each runtime bounds its own cleanup.
 func (fa *FunctionAddresses) Stop(ctx context.Context) error {
 	var errs []error
-	for name, rctx := range fa.contexts {
-		if err := rctx.Stop(ctx); err != nil {
-			errs = append(errs, errors.Wrapf(err, "cannot stop function %q runtime (target %q)", name, rctx.Target))
+	for _, rt := range fa.runtimes {
+		if err := rt.Stop(ctx); err != nil {
+			errs = append(errs, errors.Wrapf(err, "cannot stop function %q runtime (target %q)", rt.name, rt.Target))
 		}
 	}
 	return errors.Join(errs...)
@@ -122,25 +132,41 @@ func (fa *FunctionAddresses) Stop(ctx context.Context) error {
 // gRPC addresses. The caller must call Stop on the returned FunctionAddresses
 // when done.
 func StartFunctionRuntimes(ctx context.Context, log logging.Logger, fns []pkgv1.Function) (*FunctionAddresses, error) {
-	addrs := make(map[string]string, len(fns))
-	contexts := make(map[string]RuntimeContext, len(fns))
+	return startFunctionRuntimes(ctx, log, fns, GetRuntime)
+}
+
+// startFunctionRuntimes implements StartFunctionRuntimes, using getRuntime to
+// get each Function's runtime.
+func startFunctionRuntimes(ctx context.Context, log logging.Logger, fns []pkgv1.Function, getRuntime func(pkgv1.Function, logging.Logger) (Runtime, error)) (*FunctionAddresses, error) {
+	fa := &FunctionAddresses{addrs: make(map[string]string, len(fns))}
 
 	for _, fn := range fns {
-		rt, err := GetRuntime(fn, log)
+		rt, err := getRuntime(fn, log)
 		if err != nil {
-			return nil, errors.Wrapf(err, "cannot get runtime for Function %q", fn.GetName())
+			return nil, stopStarted(ctx, fa, errors.Wrapf(err, "cannot get runtime for Function %q", fn.GetName()))
 		}
 
 		rctx, err := rt.Start(ctx)
 		if err != nil {
-			return nil, errors.Wrapf(err, "cannot start Function %q", fn.GetName())
+			return nil, stopStarted(ctx, fa, errors.Wrapf(err, "cannot start Function %q", fn.GetName()))
 		}
 
-		addrs[fn.GetName()] = rctx.Target
-		contexts[fn.GetName()] = rctx
+		fa.addrs[fn.GetName()] = rctx.Target
+		fa.runtimes = append(fa.runtimes, startedRuntime{name: fn.GetName(), RuntimeContext: rctx})
 	}
 
-	return &FunctionAddresses{addrs: addrs, contexts: contexts}, nil
+	return fa, nil
+}
+
+// stopStarted stops the runtimes started before a later Function failed to
+// start. It returns startErr, joined with any stop errors. StopFunctionRuntimes
+// detaches the stop from ctx's cancellation, since ctx may be why the start
+// failed.
+func stopStarted(ctx context.Context, fa *FunctionAddresses, startErr error) error {
+	if err := StopFunctionRuntimes(ctx, fa); err != nil {
+		return errors.Join(startErr, err)
+	}
+	return startErr
 }
 
 // RewriteAddressesForDocker rewrites function addresses so they are reachable
