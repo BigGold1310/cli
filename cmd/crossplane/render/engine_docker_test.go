@@ -357,6 +357,8 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 
 	type args struct {
 		create func(ctx context.Context, name string, options client.NetworkCreateOptions) (client.NetworkCreateResult, error)
+		// cancel cancels Setup's context before calling cleanup.
+		cancel bool
 	}
 	type want struct {
 		err error
@@ -374,6 +376,16 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 			reason: "Setup should create a network, annotate the functions to join it, and return a cleanup that removes it.",
 			args: args{
 				create: createRenderNetworkReturns("network-id", nil),
+			},
+			want: want{
+				created: true,
+			},
+		},
+		"CleanupSurvivesCancelledContext": {
+			reason: "The cleanup typically runs after Setup's context is done, so it should still remove the network with a live context.",
+			args: args{
+				create: createRenderNetworkReturns("network-id", nil),
+				cancel: true,
 			},
 			want: want{
 				created: true,
@@ -398,9 +410,14 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 			removed := false
 			cli := &mockNetworkClient{MockNetworkCreate: tc.args.create}
 			if tc.want.created {
-				cli.MockNetworkRemove = func(_ context.Context, networkID string, _ client.NetworkRemoveOptions) (client.NetworkRemoveResult, error) {
+				cli.MockNetworkRemove = func(ctx context.Context, networkID string, _ client.NetworkRemoveOptions) (client.NetworkRemoveResult, error) {
 					if diff := cmp.Diff("network-id", networkID); diff != "" {
 						t.Errorf("\n%s\nNetworkRemove(...): -want network ID, +got network ID:\n%s", tc.reason, diff)
+					}
+					// Cleanup typically runs after Setup's context is done, so it
+					// must remove the network with a live context.
+					if err := ctx.Err(); err != nil {
+						t.Errorf("\n%s\nNetworkRemove(...): want a live context, got: %v", tc.reason, err)
 					}
 					removed = true
 					return client.NetworkRemoveResult{}, nil
@@ -409,7 +426,10 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 			e := &dockerRenderEngine{log: logging.NewNopLogger(), networks: cli}
 			fns := []pkgv1.Function{functionWithAnnotations(nil)}
 
-			cleanup, err := e.Setup(t.Context(), fns)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			cleanup, err := e.Setup(ctx, fns)
 
 			if diff := cmp.Diff(tc.want.err, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\nSetup(...): -want error, +got error:\n%s", tc.reason, diff)
@@ -428,6 +448,9 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 				t.Errorf("\n%s\nSetup(...): -want fns, +got fns:\n%s", tc.reason, diff)
 			}
 
+			if tc.args.cancel {
+				cancel()
+			}
 			cleanup()
 
 			if diff := cmp.Diff(tc.want.created, removed); diff != "" {
