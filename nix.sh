@@ -25,8 +25,10 @@ if [ "${NIX_SH_CONTAINER:-}" = "1" ]; then
 
 	# Start the Docker daemon, storing its data in the crossplane-cli-nix volume
 	# for persistence across container runs. This gives us a consistent Docker
-	# environment with cached images (e.g., kind node images).
-	dockerd --data-root=/nix/docker >/tmp/dockerd.log 2>&1 &
+	# environment with cached images (e.g., kind node images). Run it from / so
+	# its children don't use the bind-mounted checkout as their working
+	# directory; a crashing child would otherwise leave a core file there.
+	(cd / && exec dockerd --data-root=/nix/docker >/tmp/dockerd.log 2>&1) &
 
 	attempts=0
 	until docker info >/dev/null 2>&1; do
