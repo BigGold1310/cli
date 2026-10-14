@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/netip"
 	"path"
 	"path/filepath"
 	"slices"
@@ -266,6 +268,54 @@ func StartWithCopyFiles(tarball []byte, path string) StartContainerOption {
 			tarball: tarball,
 		})
 	}
+}
+
+// StartWithPublishedPort publishes the container's TCP containerPort on an
+// ephemeral port on hostIP; the engine allocates the host port. Use
+// GetHostPort after the container starts to learn the allocated address.
+func StartWithPublishedPort(hostIP netip.Addr, containerPort int) StartContainerOption {
+	return func(cfg *startContainerConfig) {
+		port := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
+		if cfg.containerConfig.ExposedPorts == nil {
+			cfg.containerConfig.ExposedPorts = network.PortSet{}
+		}
+		cfg.containerConfig.ExposedPorts[port] = struct{}{}
+		if cfg.hostConfig == nil {
+			cfg.hostConfig = &container.HostConfig{}
+		}
+		if cfg.hostConfig.PortBindings == nil {
+			cfg.hostConfig.PortBindings = network.PortMap{}
+		}
+		cfg.hostConfig.PortBindings[port] = []network.PortBinding{{
+			HostIP:   hostIP,
+			HostPort: "0", // "0" => engine allocates an ephemeral port
+		}}
+	}
+}
+
+// GetHostPort returns the host address (host:port) a container's published
+// TCP containerPort is bound to.
+func GetHostPort(ctx context.Context, containerID string, containerPort int) (string, error) {
+	cli, err := NewClient()
+	if err != nil {
+		return "", err
+	}
+
+	inspect, err := cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		return "", errors.Wrap(err, "cannot inspect container")
+	}
+
+	port := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
+	bindings := inspect.Container.NetworkSettings.Ports[port]
+	if len(bindings) == 0 {
+		return "", errors.Errorf("container %q has no published binding for port %s", containerID, port.Port())
+	}
+	binding := bindings[0]
+	if !binding.HostIP.IsValid() {
+		return "", errors.Errorf("container %q has a port binding for %s but no host address", containerID, port.Port())
+	}
+	return net.JoinHostPort(binding.HostIP.String(), binding.HostPort), nil
 }
 
 // StartWithEnv adds environment variables that will be passed to the container.

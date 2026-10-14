@@ -28,9 +28,38 @@ import (
 	bspinner "charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/term"
 
 	"github.com/crossplane/cli/v2/internal/async"
 )
+
+// ttyInput returns the input to attach to a spinner program. The spinners
+// never use key input, but bubbletea queries the terminal for capabilities
+// (synchronized output and grapheme clustering) on startup, and the terminal
+// writes its replies to stdin: without a reader in raw mode they echo as
+// stray escape sequences after the spinner text. Attaching a TTY stdin lets
+// bubbletea consume them. Piped stdin stays detached so spinners never eat
+// piped data.
+func ttyInput() io.Reader {
+	if term.IsTerminal(os.Stdin.Fd()) {
+		return os.Stdin
+	}
+	return nil
+}
+
+// interruptKey handles ctrl+c for a spinner program with a TTY attached: raw
+// mode swallows SIGINT, so the key arrives as input and must mirror what the
+// signal handler does for external signals.
+func interruptKey(p *tea.Program, msg tea.Msg) {
+	k, ok := msg.(tea.KeyPressMsg)
+	if !ok || k.String() != "ctrl+c" {
+		return
+	}
+	if p != nil {
+		_ = p.ReleaseTerminal()
+	}
+	os.Exit(130)
+}
 
 // SpinnerPrinter prints spinners to the console.
 type SpinnerPrinter interface {
@@ -207,6 +236,8 @@ func (m *MultiSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	interruptKey(m.program, msg)
+
 	if _, ok := msg.(tickMsg); !ok {
 		return m, nil
 	}
@@ -276,7 +307,7 @@ func (m *MultiSpinner) Fail(title string) {
 // Start starts the spinners.
 func (m *MultiSpinner) Start() {
 	m.program = tea.NewProgram(m,
-		tea.WithInput(nil),
+		tea.WithInput(ttyInput()),
 		tea.WithoutSignalHandler(),
 		tea.WithOutput(m.out),
 	)
@@ -348,6 +379,8 @@ func (ss *SuccessSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
+	interruptKey(ss.program, msg)
+
 	if _, ok := msg.(tickMsg); !ok {
 		return ss, nil
 	}
@@ -415,7 +448,7 @@ func (ss *SuccessSpinner) Logf(format string, args ...any) {
 func (ss *SuccessSpinner) Start() {
 	ss.program = tea.NewProgram(ss,
 		tea.WithOutput(ss.out),
-		tea.WithInput(nil),
+		tea.WithInput(ttyInput()),
 		tea.WithoutSignalHandler(),
 	)
 
