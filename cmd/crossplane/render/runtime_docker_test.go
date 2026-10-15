@@ -672,6 +672,7 @@ func TestRuntimeDockerStartLabels(t *testing.T) {
 
 	type args struct {
 		cleanup DockerCleanup
+		session string
 		cli     *mockContainerClient
 	}
 	type want struct {
@@ -690,6 +691,7 @@ func TestRuntimeDockerStartLabels(t *testing.T) {
 				cli: &mockContainerClient{
 					MockContainerCreate: createLabeledContainer(map[string]string{
 						LabelKeyManagedBy: LabelValueManagedByCrossplane,
+						LabelKeySession:   sessionID(),
 						LabelKeyCleanup:   string(AnnotationValueRuntimeDockerCleanupStop),
 					}),
 					MockContainerStart:   startContainer(containerID),
@@ -704,6 +706,23 @@ func TestRuntimeDockerStartLabels(t *testing.T) {
 				cli: &mockContainerClient{
 					MockContainerCreate: createLabeledContainer(map[string]string{
 						LabelKeyManagedBy: LabelValueManagedByCrossplane,
+						LabelKeySession:   sessionID(),
+						LabelKeyCleanup:   string(AnnotationValueRuntimeDockerCleanupRemove),
+					}),
+					MockContainerStart:   startContainer(containerID),
+					MockContainerInspect: inspectContainerOnNetwork(containerID, containerName, dockerNetwork),
+				},
+			},
+		},
+		"CallerSuppliedSession": {
+			reason: "Function containers should carry the caller-supplied session ID instead of the per-process default.",
+			args: args{
+				cleanup: AnnotationValueRuntimeDockerCleanupRemove,
+				session: "my-session",
+				cli: &mockContainerClient{
+					MockContainerCreate: createLabeledContainer(map[string]string{
+						LabelKeyManagedBy: LabelValueManagedByCrossplane,
+						LabelKeySession:   "my-session",
 						LabelKeyCleanup:   string(AnnotationValueRuntimeDockerCleanupRemove),
 					}),
 					MockContainerStart:   startContainer(containerID),
@@ -718,6 +737,7 @@ func TestRuntimeDockerStartLabels(t *testing.T) {
 				cli: &mockContainerClient{
 					MockContainerCreate: createLabeledContainer(map[string]string{
 						LabelKeyManagedBy: LabelValueManagedByCrossplane,
+						LabelKeySession:   sessionID(),
 						LabelKeyCleanup:   string(AnnotationValueRuntimeDockerCleanupOrphan),
 					}),
 					MockContainerStart:   startContainer(containerID),
@@ -732,6 +752,7 @@ func TestRuntimeDockerStartLabels(t *testing.T) {
 			r := &RuntimeDocker{
 				Image:        "xpkg.crossplane.io/crossplane-contrib/function-dummy:v0.1.0",
 				Cleanup:      tc.args.cleanup,
+				Session:      tc.args.session,
 				PullPolicy:   AnnotationValueRuntimeDockerPullPolicyIfNotPresent,
 				Keychain:     authn.NewMultiKeychain(),
 				Network:      dockerNetwork,

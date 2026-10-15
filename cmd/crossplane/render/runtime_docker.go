@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -32,6 +33,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
+	"k8s.io/apimachinery/pkg/util/rand"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
@@ -80,6 +82,12 @@ const (
 	// Docker container (e.g. a GitHub Actions container job) and function
 	// containers must be on the same network to be reachable.
 	AnnotationKeyRuntimeDockerNetwork = "render.crossplane.io/runtime-docker-network"
+
+	// AnnotationKeyRuntimeDockerSession sets the value of the
+	// render.crossplane.io/session label on the Function's Docker container.
+	// When unset, a per-process session ID is used. Render engines set this
+	// annotation from their configured session ID.
+	AnnotationKeyRuntimeDockerSession = "render.crossplane.io/runtime-docker-session"
 )
 
 // Labels that render applies to the Docker resources it creates, so that
@@ -93,21 +101,41 @@ const (
 	// LabelValueManagedByCrossplane is the value of LabelKeyManagedBy.
 	LabelValueManagedByCrossplane = "crossplane-cli"
 
+	// LabelKeySession is applied to every Docker container and network created
+	// by render. Its value identifies the render session that created the
+	// resource, so cleanup can be scoped to a single run. Callers may supply
+	// the session ID (see EngineFlags.SessionID); otherwise a per-process ID is
+	// generated.
+	LabelKeySession = "render.crossplane.io/session"
+
 	// LabelKeyCleanup is applied to Function containers and records the
 	// effective DockerCleanup policy the container was created with.
 	LabelKeyCleanup = "render.crossplane.io/cleanup"
 )
 
+// sessionID returns an identifier unique to this process. It is the session ID
+// used for Docker resources when the caller doesn't supply one.
+//
+//nolint:gochecknoglobals // Must be stable for the life of the process.
+var sessionID = sync.OnceValue(func() string { return rand.String(12) })
+
 // managedLabels returns the labels applied to every Docker resource render
-// creates.
-func managedLabels() map[string]string {
-	return map[string]string{LabelKeyManagedBy: LabelValueManagedByCrossplane}
+// creates. An empty session falls back to the per-process session ID.
+func managedLabels(session string) map[string]string {
+	if session == "" {
+		session = sessionID()
+	}
+
+	return map[string]string{
+		LabelKeyManagedBy: LabelValueManagedByCrossplane,
+		LabelKeySession:   session,
+	}
 }
 
 // functionContainerLabels returns the labels applied to a Function container
-// created with the supplied cleanup policy.
-func functionContainerLabels(cleanup DockerCleanup) map[string]string {
-	l := managedLabels()
+// created with the supplied session and cleanup policy.
+func functionContainerLabels(session string, cleanup DockerCleanup) map[string]string {
+	l := managedLabels(session)
 	l[LabelKeyCleanup] = string(cleanup)
 	return l
 }
@@ -211,6 +239,10 @@ type RuntimeDocker struct {
 	// and is reached via host port bindings. When set, the container joins
 	// the specified network and is reached via its Docker hostname on port 9443.
 	Network string
+
+	// Session is the render session ID applied as the LabelKeySession label.
+	// When empty, the per-process session ID is used.
+	Session string
 
 	// dockerClient manages the Function's container. Production callers leave
 	// it nil and Start builds a real client from the environment. Tests
@@ -320,6 +352,10 @@ func GetRuntimeDocker(fn pkgv1.Function, log logging.Logger) (*RuntimeDocker, er
 		r.Network = i
 	}
 
+	if i := fn.GetAnnotations()[AnnotationKeyRuntimeDockerSession]; i != "" {
+		r.Session = i
+	}
+
 	return r, nil
 }
 
@@ -356,7 +392,7 @@ func (r *RuntimeDocker) createContainer(ctx context.Context, cli containerClient
 		// Labels are only set at creation time. A pre-existing named container
 		// that is reused is not relabeled, since Docker can't change labels on
 		// an existing container.
-		Labels: functionContainerLabels(r.Cleanup),
+		Labels: functionContainerLabels(r.Session, r.Cleanup),
 	}
 	hcfg := &container.HostConfig{}
 	var ncfg *network.NetworkingConfig

@@ -34,15 +34,21 @@ import (
 type localRenderEngine struct {
 	// BinaryPath is the path to the crossplane binary.
 	BinaryPath string
+
+	// session is the render session ID applied to Function containers. When
+	// empty, the per-process session ID is used.
+	session string
 }
 
 func (e *localRenderEngine) CheckContextSupport() error {
 	return nil
 }
 
-// Setup is a no-op for the local engine. Function containers publish ports to
-// localhost, so there's nothing extra to configure.
-func (e *localRenderEngine) Setup(_ context.Context, _ []pkgv1.Function) (func(), error) {
+// Setup only annotates fns with the session ID, if one was supplied. Function
+// containers publish ports to localhost, so there's nothing else to configure.
+func (e *localRenderEngine) Setup(_ context.Context, fns []pkgv1.Function) (func(), error) {
+	injectSessionAnnotation(fns, e.session)
+
 	return func() {}, nil
 }
 
