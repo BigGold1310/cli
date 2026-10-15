@@ -91,7 +91,7 @@ const (
 	LabelKeyManagedBy = "render.crossplane.io/managed-by"
 
 	// LabelValueManagedByCrossplane is the value of LabelKeyManagedBy.
-	LabelValueManagedByCrossplane = "crossplane"
+	LabelValueManagedByCrossplane = "crossplane-cli" 
 
 	// LabelKeyCleanup is applied to Function containers and records the
 	// effective DockerCleanup policy the container was created with.
