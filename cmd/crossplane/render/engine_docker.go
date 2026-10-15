@@ -59,6 +59,9 @@ type dockerRenderEngine struct {
 	image string
 	// network is the Docker network to connect the container to.
 	network string
+	// session is the render session ID applied to the containers and network
+	// this engine creates. When empty, the per-process session ID is used.
+	session string
 
 	log logging.Logger
 
@@ -97,6 +100,8 @@ func (e *dockerRenderEngine) CheckContextSupport() error {
 // cleanup, leaving network ownership to whoever created it. fns whose
 // runtime-docker-network annotation is already set are left untouched.
 func (e *dockerRenderEngine) Setup(ctx context.Context, fns []pkgv1.Function) (func(), error) {
+	injectSessionAnnotation(fns, e.session)
+
 	if e.network != "" {
 		// Either the user pre-configured the network via the --crossplane-docker-network flag
 		// (we don't own it), or a prior Setup call on this engine already created one (the
@@ -116,7 +121,7 @@ func (e *dockerRenderEngine) Setup(ctx context.Context, fns []pkgv1.Function) (f
 		cli = c
 	}
 
-	networkID, networkName, err := createRenderNetwork(ctx, cli)
+	networkID, networkName, err := createRenderNetwork(ctx, cli, e.session)
 	if err != nil {
 		return func() {}, errors.Wrap(err, "cannot create Docker network for rendering")
 	}
@@ -170,7 +175,7 @@ func (e *dockerRenderEngine) Render(ctx context.Context, req *renderv1alpha1.Ren
 		// Let the container access any functions running in development mode on
 		// the host.
 		docker.RunWithExtraHosts([]string{"host.docker.internal:host-gateway"}),
-		docker.RunWithLabels(managedLabels()),
+		docker.RunWithLabels(managedLabels(e.session)),
 	}
 	if e.network != "" {
 		opts = append(opts, docker.RunWithNetworkName(e.network))

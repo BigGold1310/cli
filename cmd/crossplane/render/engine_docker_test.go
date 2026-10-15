@@ -375,7 +375,7 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 		"CreatesNetwork": {
 			reason: "Setup should create a network, annotate the functions to join it, and return a cleanup that removes it.",
 			args: args{
-				create: createRenderNetworkReturns("network-id", nil),
+				create: createRenderNetworkReturns("", "network-id", nil),
 			},
 			want: want{
 				created: true,
@@ -384,7 +384,7 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 		"CleanupSurvivesCancelledContext": {
 			reason: "The cleanup typically runs after Setup's context is done, so it should still remove the network with a live context.",
 			args: args{
-				create: createRenderNetworkReturns("network-id", nil),
+				create: createRenderNetworkReturns("", "network-id", nil),
 				cancel: true,
 			},
 			want: want{
@@ -394,7 +394,7 @@ func TestDockerRenderEngineSetupCreatesNetwork(t *testing.T) {
 		"NetworkCreateError": {
 			reason: "Setup should return an error and a no-op cleanup, leaving the functions unannotated, when it cannot create the network.",
 			args: args{
-				create: createRenderNetworkReturns("", errBoom),
+				create: createRenderNetworkReturns("", "", errBoom),
 			},
 			want: want{
 				err: errBoom,

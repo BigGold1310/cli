@@ -196,6 +196,26 @@ func injectNetworkAnnotation(fns []pkgv1.Function, networkName string) {
 	}
 }
 
+// injectSessionAnnotation annotates fns so their containers carry the supplied
+// session ID. Functions that already carry the annotation are left untouched.
+// An empty session is a no-op, so containers fall back to the per-process
+// session ID.
+func injectSessionAnnotation(fns []pkgv1.Function, session string) {
+	if session == "" {
+		return
+	}
+
+	for i := range fns {
+		if fns[i].Annotations == nil {
+			fns[i].Annotations = make(map[string]string)
+		}
+
+		if _, ok := fns[i].Annotations[AnnotationKeyRuntimeDockerSession]; !ok {
+			fns[i].Annotations[AnnotationKeyRuntimeDockerSession] = session
+		}
+	}
+}
+
 // StopFunctionRuntimes stops all function runtimes and returns all failures
 // joined. Cleanup runs even if ctx is already cancelled, so it can follow an
 // interrupted render. Each runtime bounds its own cleanup.

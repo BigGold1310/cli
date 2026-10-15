@@ -103,12 +103,12 @@ const renderNetworkPrefix = "crossplane-render-"
 // createRenderNetworkReturns returns a MockNetworkCreate that returns the
 // supplied network ID and error. It returns an error instead when it is not
 // asked to create a render bridge network labeled as managed by render.
-func createRenderNetworkReturns(id string, err error) func(context.Context, string, client.NetworkCreateOptions) (client.NetworkCreateResult, error) {
+func createRenderNetworkReturns(session, id string, err error) func(context.Context, string, client.NetworkCreateOptions) (client.NetworkCreateResult, error) {
 	return func(_ context.Context, name string, options client.NetworkCreateOptions) (client.NetworkCreateResult, error) {
 		if !strings.HasPrefix(name, renderNetworkPrefix) {
 			return client.NetworkCreateResult{}, errors.Errorf("NetworkCreate(...): name %q does not have prefix %q", name, renderNetworkPrefix)
 		}
-		if diff := cmp.Diff(client.NetworkCreateOptions{Driver: "bridge", Labels: map[string]string{LabelKeyManagedBy: LabelValueManagedByCrossplane}}, options); diff != "" {
+		if diff := cmp.Diff(client.NetworkCreateOptions{Driver: "bridge", Labels: managedLabels(session)}, options); diff != "" {
 			return client.NetworkCreateResult{}, errors.Errorf("NetworkCreate(...): -want options, +got options:\n%s", diff)
 		}
 		return client.NetworkCreateResult{ID: id}, err
@@ -119,7 +119,8 @@ func TestCreateRenderNetwork(t *testing.T) {
 	errBoom := errors.New("boom")
 
 	type args struct {
-		cli networkClient
+		cli     networkClient
+		session string
 	}
 	type want struct {
 		id string
@@ -137,7 +138,18 @@ func TestCreateRenderNetwork(t *testing.T) {
 		"CreatesBridgeNetwork": {
 			reason: "createRenderNetwork should create a uniquely named bridge network through the supplied client and return its ID and name.",
 			args: args{
-				cli: &mockNetworkClient{MockNetworkCreate: createRenderNetworkReturns("network-id", nil)},
+				cli: &mockNetworkClient{MockNetworkCreate: createRenderNetworkReturns("", "network-id", nil)},
+			},
+			want: want{
+				id:         "network-id",
+				namePrefix: renderNetworkPrefix,
+			},
+		},
+		"CallerSuppliedSession": {
+			reason: "createRenderNetwork should label the network with the caller-supplied session ID rather than the per-process default.",
+			args: args{
+				cli:     &mockNetworkClient{MockNetworkCreate: createRenderNetworkReturns("my-session", "network-id", nil)},
+				session: "my-session",
 			},
 			want: want{
 				id:         "network-id",
@@ -147,7 +159,7 @@ func TestCreateRenderNetwork(t *testing.T) {
 		"NetworkCreateError": {
 			reason: "createRenderNetwork should return an error when the client cannot create the network.",
 			args: args{
-				cli: &mockNetworkClient{MockNetworkCreate: createRenderNetworkReturns("", errBoom)},
+				cli: &mockNetworkClient{MockNetworkCreate: createRenderNetworkReturns("", "", errBoom)},
 			},
 			want: want{
 				err: errBoom,
@@ -157,7 +169,7 @@ func TestCreateRenderNetwork(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			id, networkName, err := createRenderNetwork(t.Context(), tc.args.cli)
+			id, networkName, err := createRenderNetwork(t.Context(), tc.args.cli, tc.args.session)
 
 			if diff := cmp.Diff(tc.want.err, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("\n%s\ncreateRenderNetwork(...): -want error, +got error:\n%s", tc.reason, diff)

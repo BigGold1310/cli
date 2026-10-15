@@ -67,12 +67,12 @@ func newNetworkClient() (networkClient, error) {
 // createRenderNetwork creates a temporary Docker bridge network for render.
 // Function containers and the Crossplane render container join this network so
 // they can reach each other. Returns the network ID and name.
-func createRenderNetwork(ctx context.Context, cli networkClient) (string, string, error) {
+func createRenderNetwork(ctx context.Context, cli networkClient, session string) (string, string, error) {
 	name := fmt.Sprintf("crossplane-render-%s", rand.String(8))
 
 	resp, err := cli.NetworkCreate(ctx, name, client.NetworkCreateOptions{
 		Driver: "bridge",
-		Labels: managedLabels(),
+		Labels: managedLabels(session),
 	})
 	if err != nil {
 		return "", "", errors.Wrapf(err, "cannot create Docker network %q", name)
