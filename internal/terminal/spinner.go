@@ -23,44 +23,14 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	bspinner "charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/charmbracelet/x/term"
 
 	"github.com/crossplane/cli/v2/internal/async"
 )
-
-// ttyInput returns the input to attach to a spinner program. The spinners
-// never use key input, but bubbletea queries the terminal for capabilities
-// (synchronized output and grapheme clustering) on startup, and the terminal
-// writes its replies to stdin: without a reader in raw mode they echo as
-// stray escape sequences after the spinner text. Attaching a TTY stdin lets
-// bubbletea consume them. Piped stdin stays detached so spinners never eat
-// piped data.
-func ttyInput() io.Reader {
-	if term.IsTerminal(os.Stdin.Fd()) {
-		return os.Stdin
-	}
-	return nil
-}
-
-// interruptKey handles ctrl+c for a spinner program with a TTY attached: raw
-// mode swallows the terminal's SIGINT, so the key arrives as input and must
-// be re-raised as the signal it stands for. Main's signal.NotifyContext then
-// cancels the command context, in-flight work unwinds, and deferred cleanup
-// runs, exactly as for an external signal. Exiting here instead would skip
-// that cleanup.
-func interruptKey(msg tea.Msg) {
-	k, ok := msg.(tea.KeyPressMsg)
-	if !ok || k.String() != "ctrl+c" {
-		return
-	}
-	_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
-}
 
 // SpinnerPrinter prints spinners to the console.
 type SpinnerPrinter interface {
@@ -237,8 +207,6 @@ func (m *MultiSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	interruptKey(msg)
-
 	if _, ok := msg.(tickMsg); !ok {
 		return m, nil
 	}
@@ -308,7 +276,7 @@ func (m *MultiSpinner) Fail(title string) {
 // Start starts the spinners.
 func (m *MultiSpinner) Start() {
 	m.program = tea.NewProgram(m,
-		tea.WithInput(ttyInput()),
+		tea.WithInput(nil),
 		tea.WithoutSignalHandler(),
 		tea.WithOutput(m.out),
 	)
@@ -380,8 +348,6 @@ func (ss *SuccessSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	interruptKey(msg)
-
 	if _, ok := msg.(tickMsg); !ok {
 		return ss, nil
 	}
@@ -449,7 +415,7 @@ func (ss *SuccessSpinner) Logf(format string, args ...any) {
 func (ss *SuccessSpinner) Start() {
 	ss.program = tea.NewProgram(ss,
 		tea.WithOutput(ss.out),
-		tea.WithInput(ttyInput()),
+		tea.WithInput(nil),
 		tea.WithoutSignalHandler(),
 	)
 
