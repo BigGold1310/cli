@@ -24,6 +24,7 @@ package diffserver
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -84,6 +85,16 @@ type Skipped struct {
 	Reason string
 }
 
+// Input describes one provider package to run as a diff server. The zero
+// values of PublishAddress and Target mean the manager's defaults apply; set
+// them to override Docker addressing for this provider only, the way render's
+// per-function runtime annotations do.
+type Input struct {
+	Image          string
+	PublishAddress netip.Addr
+	Target         string
+}
+
 // containerRuntime is the slice of internal/docker the manager uses,
 // extracted so tests can fake container lifecycle.
 type containerRuntime interface {
@@ -102,6 +113,7 @@ type Manager struct {
 	log          logging.Logger
 	keep         bool
 	readyTimeout time.Duration
+	publishAddr  netip.Addr
 
 	mu      sync.Mutex
 	routes  map[schema.GroupKind]*Server
@@ -135,6 +147,7 @@ func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Ma
 		rt:           dockerRuntime{},
 		log:          log,
 		readyTimeout: defaultReadyTimeout,
+		publishAddr:  netip.MustParseAddr("127.0.0.1"),
 		routes:       map[schema.GroupKind]*Server{},
 	}
 	for _, opt := range opts {
@@ -148,17 +161,17 @@ func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Ma
 // effort: an image that cannot serve (no capability, fetch or startup
 // failure) is returned as skipped rather than failing the run, since its
 // resources degrade to the approximate client-side diff.
-func (m *Manager) Start(ctx context.Context, images []string) ([]Skipped, error) {
+func (m *Manager) Start(ctx context.Context, inputs []Input) ([]Skipped, error) {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
 		skipped []Skipped
 	)
-	for _, img := range images {
+	for _, in := range inputs {
 		wg.Add(1)
-		go func(img string) {
+		go func(in Input) {
 			defer wg.Done()
-			s, skip := m.startOne(ctx, img)
+			s, skip := m.startOne(ctx, in)
 			mu.Lock()
 			defer mu.Unlock()
 			if skip != nil {
@@ -166,10 +179,20 @@ func (m *Manager) Start(ctx context.Context, images []string) ([]Skipped, error)
 				return
 			}
 			m.register(s)
-		}(img)
+		}(in)
 	}
 	wg.Wait()
 	return skipped, ctx.Err()
+}
+
+// Images wraps plain image references into Inputs with no per-provider
+// overrides.
+func Images(images []string) []Input {
+	ins := make([]Input, 0, len(images))
+	for _, img := range images {
+		ins = append(ins, Input{Image: img})
+	}
+	return ins
 }
 
 func (m *Manager) register(s *Server) {
@@ -186,7 +209,9 @@ func (m *Manager) register(s *Server) {
 	}
 }
 
-func (m *Manager) startOne(ctx context.Context, image string) (*Server, *Skipped) {
+func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
+	image := in.Image
+
 	pkg, err := m.pkgs.Get(ctx, image)
 	if err != nil {
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot fetch package: %s", err)}
@@ -202,12 +227,28 @@ func (m *Manager) startOne(ctx context.Context, image string) (*Server, *Skipped
 		return nil, &Skipped{Image: image, Reason: "package contains no CRDs to route"}
 	}
 
-	id, reused, err := m.ensureContainer(ctx, containerName(pkg.Digest), image)
+	// Run the container from the reference the package client resolved, so
+	// ImageConfig path rewriting applies to the container image exactly as it
+	// applied to the package fetch.
+	runImage := pkg.ResolvedRef()
+	if pkg.ResolvedSource == "" {
+		runImage = image
+	}
+
+	// The manager's loopback default is overridable per provider: Input
+	// carries the publish and target addresses from the provider manifest's
+	// runtime annotations, the way render's per-function annotations work.
+	publishAddr := m.publishAddr
+	if in.PublishAddress.IsValid() {
+		publishAddr = in.PublishAddress
+	}
+
+	id, reused, err := m.ensureContainer(ctx, containerName(pkg.Digest), runImage, publishAddr)
 	if err != nil {
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot start diff server container: %s", err)}
 	}
 
-	server, err := m.connect(ctx, id, image)
+	server, err := m.connect(ctx, id, image, in.Target)
 	if err != nil {
 		if !reused && !m.keep {
 			if serr := m.rt.StopContainerByID(ctx, id); serr != nil {
@@ -225,7 +266,7 @@ func (m *Manager) startOne(ctx context.Context, image string) (*Server, *Skipped
 
 // ensureContainer finds a live container with the deterministic name for this
 // package digest and reuses it, or starts a new one.
-func (m *Manager) ensureContainer(ctx context.Context, name, image string) (id string, reused bool, err error) {
+func (m *Manager) ensureContainer(ctx context.Context, name, image string, publishAddr netip.Addr) (id string, reused bool, err error) {
 	id, found, running, err := m.rt.GetRunningContainerIDByName(ctx, name)
 	if err != nil {
 		return "", false, err
@@ -242,15 +283,22 @@ func (m *Manager) ensureContainer(ctx context.Context, name, image string) (id s
 	id, err = m.rt.StartContainer(ctx, name, image,
 		// --debug precedes the subcommand: it is the provider's global flag.
 		docker.StartWithCommand([]string{"--debug", "internal", "diff-server", "--address", fmt.Sprintf(":%d", containerPort)}),
-		docker.StartWithPublishedPort(netip.MustParseAddr("127.0.0.1"), containerPort),
+		docker.StartWithPublishedPort(publishAddr, containerPort),
 	)
 	return id, false, err
 }
 
-func (m *Manager) connect(ctx context.Context, containerID, image string) (*Server, error) {
+func (m *Manager) connect(ctx context.Context, containerID, image, target string) (*Server, error) {
 	addr, err := m.rt.GetHostPort(ctx, containerID, containerPort)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot determine diff server address")
+	}
+	if target != "" {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, errors.Wrapf(err, "cannot parse diff server address %q", addr)
+		}
+		addr = net.JoinHostPort(target, port)
 	}
 
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))

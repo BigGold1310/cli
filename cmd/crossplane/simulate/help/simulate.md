@@ -12,11 +12,15 @@ includes replacement detection, values known only after apply, and redacted
 sensitive values. A resource with no live counterpart plans as a create.
 
 Which providers run as diff servers comes from the current kubeconfig context
-by default: the CLI lists the providers installed on the cluster and uses
-their package images, so the preview matches the provider versions the
-cluster actually runs. --provider-images overrides that discovery, for
+by default: the CLI follows each resource's kind to the provider that
+installed it on the cluster, so the preview matches the provider versions
+actually serving those resources. --providers overrides that discovery with
+a file of Provider manifests (like render takes Function manifests), for
 example to preview how a provider version that is not installed yet would
-treat existing resources.
+treat existing resources. The manifests also carry per-provider runtime
+annotations (`simulate.crossplane.io/runtime-docker-publish-address` and
+`simulate.crossplane.io/runtime-docker-target`) for Docker setups where the
+published port is not reachable on the address the daemon reports.
 
 Not every provider serves diffs. A provider package declares the capability
 in its metadata, and a resource whose provider serves no diff server (or
@@ -33,16 +37,29 @@ edit-simulate-edit loop, --keep-diff-servers leaves the containers running so
 the next run reuses them; they are named `crossplane-diff-server-DIGEST` and
 are cleaned up by any later run without the flag, or manually with docker rm.
 
-Examples:
+## Examples
 
-  # Preview what applying resources.yaml would do.
-  crossplane resource simulate -f resources.yaml
+Preview what applying resources.yaml would do:
 
-  # Preview against a specific provider version instead of the installed one.
-  crossplane resource simulate -f resources.yaml --provider-images xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0
+```shell
+crossplane resource simulate -f resources.yaml
+```
 
-  # Keep diff servers running for faster subsequent runs.
-  crossplane resource simulate -f resources.yaml --keep-diff-servers
+Preview against specific provider versions instead of the installed ones,
+from a checked-in file of Provider manifests:
 
-  # Emit machine-readable results for CI gating.
-  crossplane resource simulate -f resources.yaml -o json
+```shell
+crossplane resource simulate -f resources.yaml --providers providers.yaml
+```
+
+Keep diff servers running for faster subsequent runs:
+
+```shell
+crossplane resource simulate -f resources.yaml --keep-diff-servers
+```
+
+Emit machine-readable results for CI gating:
+
+```shell
+crossplane resource simulate -f resources.yaml -o json
+```

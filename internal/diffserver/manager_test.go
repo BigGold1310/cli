@@ -233,7 +233,7 @@ func TestManagerStart(t *testing.T) {
 		rt := &fakeRuntime{}
 		m := NewManager(pkgs, log, WithContainerRuntime(rt))
 
-		skipped, err := m.Start(ctx, []string{"xpkg.example.org/provider-aws-s3:v2.9.0"})
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-s3:v2.9.0"}))
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
@@ -249,7 +249,7 @@ func TestManagerStart(t *testing.T) {
 		rt := &fakeRuntime{addr: servePlanService(t)}
 		m := NewManager(pkgs, log, WithContainerRuntime(rt))
 
-		skipped, err := m.Start(ctx, []string{"xpkg.example.org/provider-aws-ec2:v2.9.0"})
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
@@ -291,7 +291,7 @@ func TestManagerStart(t *testing.T) {
 		}
 		m := NewManager(pkgs, log, WithContainerRuntime(rt))
 
-		skipped, err := m.Start(ctx, []string{"xpkg.example.org/provider-aws-ec2:v2.9.0"})
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil || len(skipped) != 0 {
 			t.Fatalf("Start(...): unexpected error or skips: %v %+v", err, skipped)
 		}
@@ -304,7 +304,7 @@ func TestManagerStart(t *testing.T) {
 		rt := &fakeRuntime{addr: servePlanService(t)}
 		m := NewManager(pkgs, log, WithContainerRuntime(rt), WithKeepServers(true))
 
-		if _, err := m.Start(ctx, []string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}); err != nil {
+		if _, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"})); err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
 		if err := m.Stop(ctx); err != nil {
@@ -326,7 +326,7 @@ func TestManagerStart(t *testing.T) {
 		rt := &fakeRuntime{addr: lis.Addr().String()}
 		m := NewManager(pkgs, log, WithContainerRuntime(rt), WithReadyTimeout(700*time.Millisecond))
 
-		skipped, err := m.Start(ctx, []string{"xpkg.example.org/provider-aws-ec2:v2.9.0"})
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}

@@ -119,13 +119,19 @@ along as the actual state), and renders the response. A resource with no live co
 before apply".
 
 Which providers answer those plans comes from the current kubeconfig
-context by default: the CLI lists the providers installed on the target
-cluster and runs their package images as diff servers, so the preview uses
-the provider versions the cluster actually runs. `--provider-images` is
-optional and overrides that discovery for the cases where the cluster is
-not the source of truth, most importantly the provider upgrade preview
-below, where the point is to plan with a version that is not installed
-yet.
+context by default: the CLI follows each resource's kind to its CRD and the
+provider revision that installed it, and runs those providers' package
+images as diff servers, so the preview uses exactly the provider versions
+serving the resources being simulated. `--providers` is optional and
+overrides that discovery with a file of Provider manifests, the way render
+takes Function manifests, for the cases where the cluster is not the
+source of truth, most importantly the provider upgrade preview below,
+where the point is to plan with a version that is not installed yet.
+Manifests rather than bare image references, so the override can be
+checked in and shared, and so per-provider runtime configuration has a
+carrier: the `simulate.crossplane.io/runtime-docker-*` annotations mirror
+render's per-function runtime annotations for the Docker setups where the
+published port is not reachable on the address the daemon reports.
 
 ### Previewing a Provider Upgrade
 
@@ -135,7 +141,7 @@ preview an upgrade, run the new version's image as the diff server and
 hand it the fleet:
 
 ```console
-$ crossplane resource simulate --all --provider-images xpkg.example.org/provider-aws-s3:v2.1.0
+$ crossplane resource simulate --all --providers provider-aws-s3-v2.1.0.yaml
 Found 214 managed resources in groups served by provider-aws-s3.
 
 [-/+] Bucket.s3.aws.upbound.io legacy-logs (replace)
@@ -281,7 +287,7 @@ type simulateCmd struct {
 	Input          []string      `short:"f" help:"Project file (default), or changed Composition or XR files."`
 	Namespace      string        `help:"Simulate only XRs in this namespace."`
 	Name           string        `help:"Simulate only the XR with this name."`
-	ProviderImages []string      `help:"Override the provider images to run as diff servers."`
+	Providers      string        `help:"Provider manifests to run as diff servers, overriding cluster discovery."`
 	IncludePinned  bool          `help:"Also simulate XRs pinned to older composition revisions."`
 	SkipPlan        bool         `help:"Skip the cloud-layer plan; show only the cluster-layer diff."`
 	KeepDiffServers bool         `help:"Leave diff server containers running for reuse by later runs."`
@@ -303,9 +309,10 @@ The CLI treats provider packages the way render treats function packages: as
 images it can run locally and talk to over gRPC.
 
 The provider images come from the project's `dependsOn` for `project
-simulate`, from the providers installed on the current cluster context for
-`resource simulate`, or from an explicit `--provider-images` override of
-either. The CLI starts each provider
+simulate`, from the providers serving the simulated resources on the
+current cluster context for `resource simulate`, or from an explicit
+`--providers` override of either, a file of Provider manifests, the way
+render takes Function manifests. The CLI starts each provider
 image with its `internal diff-server` entrypoint as a local Docker
 container, following the same runtime conventions render established for
 functions (pull policy, cleanup on exit), and talks to it over plaintext
@@ -323,11 +330,11 @@ resource with no route is detected up front, not by a failed call. The
 protocol is alpha, merged to upjet's main branch ahead of a release, and
 simulate enters the CLI as alpha alongside it.
 
-That split is what makes the `--provider-images` override simple: the flag
-only changes where the image list comes from, never how routing works. The
+That split is what makes the `--providers` override simple: the flag only
+changes where the provider list comes from, never how routing works. The
 CLI never hardcodes which image serves which group and kind, not from
-image names, not from cluster state. It inspects whatever images the list
-contains and lets each package declare its capability and its kinds
+image names, not from cluster state. It inspects whatever packages the
+manifests name and lets each package declare its capability and its kinds
 through its own metadata. Override the list with a new provider version
 and the routing table rebuilds itself from what that version actually
 ships.

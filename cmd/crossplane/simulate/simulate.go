@@ -22,6 +22,7 @@ package simulate
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/discovery/cached/memory"
@@ -46,12 +48,14 @@ import (
 
 	"github.com/crossplane/crossplane/apis/v2/pkg"
 	pkgv1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
+	pkgv1beta1 "github.com/crossplane/crossplane/apis/v2/pkg/v1beta1"
 
 	"github.com/crossplane/cli/v2/cmd/crossplane/common/load"
 	"github.com/crossplane/cli/v2/internal/diffserver"
 	"github.com/crossplane/cli/v2/internal/docker"
 	"github.com/crossplane/cli/v2/internal/kube"
 	"github.com/crossplane/cli/v2/internal/plan"
+	"github.com/crossplane/cli/v2/internal/project/projectfile"
 	"github.com/crossplane/cli/v2/internal/terminal"
 	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 
@@ -61,16 +65,30 @@ import (
 //go:embed help/simulate.md
 var helpDetail string
 
+// Per-provider runtime annotations on Provider manifests passed via
+// --providers, mirroring render's per-function runtime-docker annotations.
+const (
+	// AnnotationKeyDockerPublishAddress sets the address Docker publishes
+	// this provider's diff server port on. Defaults to loopback only.
+	AnnotationKeyDockerPublishAddress = "simulate.crossplane.io/runtime-docker-publish-address"
+	// AnnotationKeyDockerTarget sets the host used to connect to this
+	// provider's diff server when it differs from the publish address, e.g.
+	// with a VM-based or remote Docker daemon.
+	AnnotationKeyDockerTarget = "simulate.crossplane.io/runtime-docker-target"
+)
+
 // Cmd previews what applying managed resources would do.
 type Cmd struct {
 	Filename string `help:"YAML file(s) or directory with managed resources, or '-' for stdin (comma-separated)." predictor:"yaml_file_or_directory" required:"" short:"f"`
 
-	ProviderImages  []string      `help:"Override the provider images to run as diff servers. Defaults to the providers installed on the cluster." name:"provider-images"`
-	KeepDiffServers bool          `help:"Leave diff server containers running for reuse by later runs."                                            name:"keep-diff-servers"`
-	Context         string        `default:""                                                                                                      help:"Kubernetes context."                               name:"context"                                  predictor:"context"   short:"c"`
-	CacheDir        string        `default:"~/.crossplane/cache"                                                                                   help:"Cache directory for downloaded provider packages." name:"cache-dir"                                predictor:"directory"`
-	Timeout         time.Duration `default:"2m"                                                                                                    help:"Per-resource plan timeout."`
-	Output          string        `default:"plan"                                                                                                  enum:"plan,json,yaml"                                    help:"Output format. One of: plan, json, yaml." name:"output"         short:"o"`
+	Providers       string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                                    optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
+	ImageConfigs    string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                                optional:""                                     predictor:"yaml_file"              type:"existingfile"`
+	ProjectFile     string        `default:"${project_file}"                                                                                                                                             help:"Path to a project definition file to read imageConfigs from." name:"project-file"`
+	KeepDiffServers bool          `help:"Leave diff server containers running for reuse by later runs."                                                                                                  name:"keep-diff-servers"`
+	Context         string        `default:""                                                                                                                                                            help:"Kubernetes context."                                          name:"context"                                  predictor:"context"                short:"c"`
+	CacheDir        string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages."            name:"cache-dir"                                predictor:"directory"`
+	Timeout         time.Duration `default:"2m"                                                                                                                                                          help:"Per-resource plan timeout."`
+	Output          string        `default:"plan"                                                                                                                                                        enum:"plan,json,yaml"                                               help:"Output format. One of: plan, json, yaml." name:"output"                      short:"o"`
 
 	Impersonation kube.ImpersonationFlags `embed:""`
 }
@@ -117,17 +135,34 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPri
 		return err
 	}
 
-	images := c.ProviderImages
-	if len(images) == 0 {
-		if images, err = installedProviderImages(ctx, kubeClient); err != nil {
-			return errors.Wrap(err, "cannot discover providers installed on the cluster")
-		}
+	imageConfigs, err := c.imageConfigs()
+	if err != nil {
+		return err
 	}
-	if len(images) == 0 {
+
+	var inputs []diffserver.Input
+	if c.Providers != "" {
+		if inputs, err = loadProviderInputs(c.Providers); err != nil {
+			return errors.Wrapf(err, "cannot load provider manifests from %q", c.Providers)
+		}
+	} else {
+		// With local ImageConfigs the rewrites apply to original package
+		// references, so discovery must hand those out; without them the
+		// cluster's resolved reference is the exact artifact it runs.
+		images, err := relevantProviderImages(ctx, kubeClient, rmapper, resources, len(imageConfigs) > 0)
+		if err != nil {
+			return errors.Wrap(err, "cannot discover the providers serving the given resources")
+		}
+		inputs = diffserver.Images(images)
+	}
+	if len(inputs) == 0 {
 		_, _ = fmt.Fprintln(k.Stderr, "No providers found to run as diff servers; all results will be approximate.")
 	}
 
-	pkgClient, err := clixpkg.NewClient(clixpkg.NewRemoteFetcher(), clixpkg.WithCacheDir(afero.NewOsFs(), c.CacheDir))
+	pkgClient, err := clixpkg.NewClient(clixpkg.NewRemoteFetcher(),
+		clixpkg.WithCacheDir(afero.NewOsFs(), c.CacheDir),
+		clixpkg.WithImageConfigs(imageConfigs),
+	)
 	if err != nil {
 		return errors.Wrap(err, "cannot create package client")
 	}
@@ -136,7 +171,7 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPri
 	var skipped []diffserver.Skipped
 	if err := sp.WrapWithSuccessSpinner("Starting provider diff servers", func() error {
 		var err error
-		skipped, err = mgr.Start(ctx, images)
+		skipped, err = mgr.Start(ctx, inputs)
 		return err
 	}); err != nil {
 		return errors.Wrap(err, "cannot start diff servers")
@@ -156,6 +191,90 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPri
 	}
 
 	return plan.Render(k.Stdout, c.Output, plans)
+}
+
+// imageConfigs returns the ImageConfigs to rewrite provider image paths with:
+// the --image-configs file when given, else the imageConfigs of the project
+// the command happens to run in, if any. Running outside a project is the
+// norm for this command, so a missing project file is not an error.
+func (c *Cmd) imageConfigs() ([]pkgv1beta1.ImageConfig, error) {
+	if c.ImageConfigs != "" {
+		ics, err := loadImageConfigs(c.ImageConfigs)
+		return ics, errors.Wrapf(err, "cannot load image configs from %q", c.ImageConfigs)
+	}
+
+	projFilePath, err := filepath.Abs(c.ProjectFile)
+	if err != nil {
+		return nil, nil //nolint:nilerr // Best effort: no resolvable project file means no project image configs.
+	}
+	if _, err := os.Stat(projFilePath); err != nil {
+		return nil, nil //nolint:nilerr // Best effort: no project file means no project image configs.
+	}
+	projFS := afero.NewBasePathFs(afero.NewOsFs(), filepath.Dir(projFilePath))
+	proj, err := projectfile.Parse(projFS, filepath.Base(projFilePath))
+	if err != nil {
+		return nil, errors.Wrapf(err, "cannot parse project file %q", c.ProjectFile)
+	}
+	return proj.Spec.ImageConfigs, nil
+}
+
+// loadProviderInputs reads Provider manifests and turns them into diff server
+// inputs: the package image from spec.package, and per-provider Docker
+// overrides from the simulate.crossplane.io runtime annotations.
+func loadProviderInputs(path string) ([]diffserver.Input, error) {
+	loader, err := load.NewLoader(path)
+	if err != nil {
+		return nil, err
+	}
+	objs, err := loader.Load()
+	if err != nil {
+		return nil, err
+	}
+
+	inputs := make([]diffserver.Input, 0, len(objs))
+	for _, o := range objs {
+		if o.GetKind() != "Provider" {
+			return nil, errors.Errorf("expected only Provider manifests, found %s", o.GetKind())
+		}
+		in := diffserver.Input{}
+		if in.Image, _, _ = unstructured.NestedString(o.Object, "spec", "package"); in.Image == "" {
+			return nil, errors.Errorf("provider %q has no spec.package", o.GetName())
+		}
+		annotations := o.GetAnnotations()
+		if v := annotations[AnnotationKeyDockerPublishAddress]; v != "" {
+			if in.PublishAddress, err = netip.ParseAddr(v); err != nil {
+				return nil, errors.Wrapf(err, "provider %q has an invalid %s annotation", o.GetName(), AnnotationKeyDockerPublishAddress)
+			}
+		}
+		in.Target = annotations[AnnotationKeyDockerTarget]
+		inputs = append(inputs, in)
+	}
+	return inputs, nil
+}
+
+// loadImageConfigs reads ImageConfig manifests from a YAML file.
+func loadImageConfigs(path string) ([]pkgv1beta1.ImageConfig, error) {
+	loader, err := load.NewLoader(path)
+	if err != nil {
+		return nil, err
+	}
+	objs, err := loader.Load()
+	if err != nil {
+		return nil, err
+	}
+
+	ics := make([]pkgv1beta1.ImageConfig, 0, len(objs))
+	for _, o := range objs {
+		if o.GetKind() != "ImageConfig" {
+			return nil, errors.Errorf("expected only ImageConfig manifests, found %s", o.GetKind())
+		}
+		ic := pkgv1beta1.ImageConfig{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(o.Object, &ic); err != nil {
+			return nil, errors.Wrapf(err, "cannot parse ImageConfig %s", o.GetName())
+		}
+		ics = append(ics, ic)
+	}
+	return ics, nil
 }
 
 // router routes a resource's group and kind to a diff server client. It is
@@ -183,6 +302,11 @@ func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper
 		return p
 	}
 
+	// Crossplane's external tags survive every apply (the provider's
+	// initializer re-adds them), so a preview must never claim they would be
+	// removed.
+	plan.MergeExternalTags(desired, live)
+
 	gk := desired.GroupVersionKind().GroupKind()
 	planClient, ok := mgr.Route(gk)
 	if !ok {
@@ -192,7 +316,7 @@ func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper
 	pctx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
 
-	store := objectStore(ctx, kubeClient, rmapper, defaultNamespace, desired)
+	store := objectStore(ctx, kubeClient, rmapper, defaultNamespace, desired, live)
 
 	p, err := plan.Plan(pctx, planClient, desired, live, store)
 	if err != nil {
@@ -246,18 +370,30 @@ func fetchLive(ctx context.Context, kubeClient client.Client, rmapper meta.RESTM
 // offline with placeholder credentials and never needs the real ones.
 // Gathering is best effort: a missing object simply stays out of the store,
 // and the server reports precisely what it could not resolve.
-func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, desired *unstructured.Unstructured) []*unstructured.Unstructured {
-	name, _, _ := unstructured.NestedString(desired.Object, "spec", "providerConfigRef", "name")
+func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, desired, live *unstructured.Unstructured) []*unstructured.Unstructured {
+	// Read the reference from the live resource when one exists: the API
+	// server has already applied the CRD's defaults there, so its kind and
+	// name are authoritative. The desired manifest may omit both.
+	src := desired
+	if live != nil {
+		src = live
+	}
+	name, _, _ := unstructured.NestedString(src.Object, "spec", "providerConfigRef", "name")
 	if name == "" {
 		name = "default"
 	}
-	kind, _, _ := unstructured.NestedString(desired.Object, "spec", "providerConfigRef", "kind")
+	kind, _, _ := unstructured.NestedString(src.Object, "spec", "providerConfigRef", "kind")
 	if kind == "" {
+		// Legacy cluster-scoped resources have no kind in the reference and
+		// always mean ProviderConfig. Namespaced resources default to
+		// ClusterProviderConfig, per the CRD default the API server applies.
 		kind = "ProviderConfig"
+		gvk := desired.GroupVersionKind()
+		if m, err := rmapper.RESTMapping(gvk.GroupKind(), gvk.Version); err == nil && m.Scope.Name() == meta.RESTScopeNameNamespace {
+			kind = "ClusterProviderConfig"
+		}
 	}
 
-	// The provider config lives in the provider family's group, one label
-	// above the resource's group: ec2.aws.m.upbound.io -> aws.m.upbound.io.
 	group := desired.GroupVersionKind().Group
 	i := strings.Index(group, ".")
 	if i < 0 {
@@ -285,21 +421,72 @@ func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RES
 	return []*unstructured.Unstructured{pc}
 }
 
-// installedProviderImages lists the package images of the providers installed
-// on the cluster, preferring the resolved identifier over the possibly
-// constraint-form spec.package.
-func installedProviderImages(ctx context.Context, kubeClient client.Client) ([]string, error) {
-	providers := &pkgv1.ProviderList{}
-	if err := kubeClient.List(ctx, providers); err != nil {
-		return nil, err
-	}
-	images := make([]string, 0, len(providers.Items))
-	for _, p := range providers.Items {
-		img := p.Status.CurrentIdentifier
-		if img == "" {
-			img = p.Spec.Package
+// relevantProviderImages returns the package images of exactly the providers
+// that serve the given resources, so simulate never starts a diff server it
+// will not route to. Discovery follows the ownership chain on the cluster:
+// each resource's kind maps to a CRD, the CRD is owned by the
+// ProviderRevision that installed it, and the revision carries the resolved
+// package image. Kinds that resolve to no provider are skipped; their
+// resources degrade to the approximate client-side diff.
+func relevantProviderImages(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, resources []*unstructured.Unstructured, preferOriginal bool) ([]string, error) {
+	seenGK := map[schema.GroupKind]bool{}
+	seenImage := map[string]bool{}
+	var images []string
+
+	for _, r := range resources {
+		gvk := r.GroupVersionKind()
+		gk := gvk.GroupKind()
+		if seenGK[gk] {
+			continue
 		}
-		if img != "" {
+		seenGK[gk] = true
+
+		mapping, err := rmapper.RESTMapping(gk, gvk.Version)
+		if err != nil {
+			continue // The kind is not installed; nothing serves it.
+		}
+
+		crd := &unstructured.Unstructured{}
+		crd.SetGroupVersionKind(schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"})
+		crdName := mapping.Resource.Resource + "." + gk.Group
+		if err := kubeClient.Get(ctx, client.ObjectKey{Name: crdName}, crd); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, errors.Wrapf(err, "cannot get CRD %s", crdName)
+		}
+
+		revision := ""
+		for _, ref := range crd.GetOwnerReferences() {
+			if ref.Kind == "ProviderRevision" && strings.HasPrefix(ref.APIVersion, "pkg.crossplane.io/") {
+				revision = ref.Name
+				break
+			}
+		}
+		if revision == "" {
+			continue // Not provider-installed (e.g. a hand-applied CRD).
+		}
+
+		prv := &pkgv1.ProviderRevision{}
+		if err := kubeClient.Get(ctx, client.ObjectKey{Name: revision}, prv); err != nil {
+			return nil, errors.Wrapf(err, "cannot get provider revision %s owning CRD %s", revision, crdName)
+		}
+		// Prefer the resolved package: after the cluster's ImageConfig
+		// rewriting, it is the identity of the artifact the cluster actually
+		// runs, which is what the preview promises to use. If that reference
+		// is not pullable from this machine (e.g. a cluster-only mirror), the
+		// manager reports the image as skipped, its resources degrade to the
+		// approximate diff, and --provider-images remains the override for
+		// picking a locally reachable image instead. With local ImageConfigs
+		// in play (preferOriginal) the original reference is handed out
+		// instead, because that is what local rewrite rules are written
+		// against.
+		img := prv.Status.ResolvedPackage
+		if preferOriginal || img == "" {
+			img = prv.Spec.Package
+		}
+		if img != "" && !seenImage[img] {
+			seenImage[img] = true
 			images = append(images, img)
 		}
 	}
@@ -319,6 +506,9 @@ func (c *Cmd) setupKubeClient(logger logging.Logger) (client.Client, meta.RESTMa
 
 	c.Impersonation.Apply(kubeconfig)
 
+	// client-go defaults unset QPS/Burst to 5/10 with client-side throttling,
+	// which is painfully slow for the several reads simulate does per
+	// resource. Same approach as trace's setupKubeClient.
 	if kubeconfig.QPS == 0 {
 		kubeconfig.QPS = 20
 	}

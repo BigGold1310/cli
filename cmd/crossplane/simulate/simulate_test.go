@@ -18,10 +18,14 @@ package simulate
 
 import (
 	"context"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	diffv1alpha1 "github.com/crossplane/upjet/v2/proto/diff/v1alpha1"
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,6 +36,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/crossplane/crossplane/apis/v2/pkg"
+	pkgv1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
+
+	"github.com/crossplane/cli/v2/internal/diffserver"
 	"github.com/crossplane/cli/v2/internal/plan"
 )
 
@@ -79,6 +87,56 @@ func notSupportedErr(t *testing.T) error {
 		t.Fatalf("cannot build status: %v", err)
 	}
 	return st.Err()
+}
+
+func TestLoadProviderInputs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "providers.yaml")
+	manifest := `---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-ec2
+  annotations:
+    simulate.crossplane.io/runtime-docker-publish-address: 0.0.0.0
+    simulate.crossplane.io/runtime-docker-target: 192.168.64.2
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0
+---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-s3
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-s3:v2.9.0
+`
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("cannot write manifest: %v", err)
+	}
+
+	got, err := loadProviderInputs(path)
+	if err != nil {
+		t.Fatalf("loadProviderInputs(...): unexpected error: %v", err)
+	}
+	want := []diffserver.Input{
+		{
+			Image:          "xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0",
+			PublishAddress: netip.MustParseAddr("0.0.0.0"),
+			Target:         "192.168.64.2",
+		},
+		{Image: "xpkg.upbound.io/upbound/provider-aws-s3:v2.9.0"},
+	}
+	if diff := cmp.Diff(want, got, cmp.Comparer(func(a, b netip.Addr) bool { return a == b })); diff != "" {
+		t.Errorf("loadProviderInputs(...): -want, +got:\n%s", diff)
+	}
+
+	notAProvider := filepath.Join(dir, "other.yaml")
+	if err := os.WriteFile(notAProvider, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n"), 0o600); err != nil {
+		t.Fatalf("cannot write manifest: %v", err)
+	}
+	if _, err := loadProviderInputs(notAProvider); err == nil {
+		t.Errorf("loadProviderInputs(...): want an error for non-Provider manifests")
+	}
 }
 
 func TestSimulateOne(t *testing.T) {
@@ -200,6 +258,52 @@ func TestSimulateOne(t *testing.T) {
 		}
 		if k := pc2.got.GetKubernetesObjectStore()[0].GetFields()["kind"].GetStringValue(); k != "ProviderConfig" {
 			t.Errorf("simulateOne(...): want a ProviderConfig in the object store, got %q", k)
+		}
+	})
+
+	t.Run("DiscoversOnlyRelevantProviders", func(t *testing.T) {
+		crdGVK := schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
+
+		discScheme := runtime.NewScheme()
+		discScheme.AddKnownTypeWithName(crdGVK, &unstructured.Unstructured{})
+		discScheme.AddKnownTypeWithName(crdGVK.GroupVersion().WithKind("CustomResourceDefinitionList"), &unstructured.UnstructuredList{})
+		if err := pkg.AddToScheme(discScheme); err != nil {
+			t.Fatalf("cannot add pkg scheme: %v", err)
+		}
+
+		crd := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata": map[string]any{
+				"name": "vpcs.ec2.aws.upbound.io",
+				"ownerReferences": []any{map[string]any{
+					"apiVersion": "pkg.crossplane.io/v1",
+					"kind":       "ProviderRevision",
+					"name":       "provider-aws-ec2-abc123",
+					"uid":        "00000000-0000-0000-0000-000000000000",
+				}},
+			},
+		}}
+		prv := &pkgv1.ProviderRevision{}
+		prv.SetName("provider-aws-ec2-abc123")
+		prv.Status.ResolvedPackage = "xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0"
+
+		kube := fake.NewClientBuilder().WithScheme(discScheme).WithObjects(crd, prv).Build()
+
+		// Two VPCs (same kind) plus a kind with no CRD on the cluster: exactly
+		// one provider image, once.
+		unserved := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "kms.aws.upbound.io/v1beta1",
+			"kind":       "Key",
+			"metadata":   map[string]any{"name": "k"},
+		}}
+		got, err := relevantProviderImages(ctx, kube, rm, []*unstructured.Unstructured{vpc("a", "10.0.0.0/16"), vpc("b", "10.1.0.0/16"), unserved}, false)
+		if err != nil {
+			t.Fatalf("relevantProviderImages(...): unexpected error: %v", err)
+		}
+		want := []string{"xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0"}
+		if len(got) != 1 || got[0] != want[0] {
+			t.Errorf("relevantProviderImages(...): want %v, got %v", want, got)
 		}
 	})
 
