@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/rand"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
@@ -58,12 +59,67 @@ const (
 
 	// containerPrefix names diff server containers. The full name carries the
 	// package digest, so a changed image never matches a stale container and
-	// leftovers from --keep-diff-servers are easy to find.
+	// orphaned leftovers are easy to find.
 	containerPrefix = "crossplane-diff-server-"
 
 	readyPollInterval   = 500 * time.Millisecond
 	defaultReadyTimeout = 60 * time.Second
 )
+
+// Cleanup is how a diff server container is cleaned up when the manager
+// stops, following render's per-function cleanup policies.
+type Cleanup string
+
+const (
+	// CleanupRemove is the default: stop and remove the container.
+	CleanupRemove Cleanup = "Remove"
+
+	// CleanupOrphan leaves the container running, so a later run finds it by
+	// its deterministic name and reuses it without paying startup. Render's
+	// function runtimes support a third policy, Stop; a stopped diff server
+	// serves nothing and restarting costs nearly as much as starting, so
+	// simulate omits it.
+	CleanupOrphan Cleanup = "Orphan"
+)
+
+// Labels applied to the Docker containers simulate creates, mirroring
+// render's, so leftovers (a crash, or an Orphan cleanup policy) can be
+// identified and swept.
+const (
+	// LabelKeyManagedBy is applied to every diff server container. Its value
+	// is always LabelValueManagedBy.
+	LabelKeyManagedBy = "simulate.crossplane.io/managed-by"
+
+	// LabelValueManagedBy is the value of LabelKeyManagedBy.
+	LabelValueManagedBy = "crossplane-cli"
+
+	// LabelKeySession identifies the run that created a container. Orphaned
+	// containers outlive their session by design; the label records which run
+	// created them.
+	LabelKeySession = "simulate.crossplane.io/session"
+
+	// LabelKeyCleanup records the effective cleanup policy a container was
+	// created with.
+	LabelKeyCleanup = "simulate.crossplane.io/cleanup"
+)
+
+// sessionID returns an identifier unique to this process, matching render's
+// per-process Docker session IDs.
+//
+//nolint:gochecknoglobals // Must be stable for the life of the process.
+var sessionID = sync.OnceValue(func() string { return rand.String(12) })
+
+// managedLabels returns the labels applied to every container the manager
+// creates. An empty session falls back to the per-process session ID.
+func managedLabels(session string) map[string]string {
+	if session == "" {
+		session = sessionID()
+	}
+	return map[string]string{
+		LabelKeyManagedBy: LabelValueManagedBy,
+		LabelKeySession:   session,
+	}
+}
 
 // Server is a running diff server for one provider package.
 type Server struct {
@@ -72,9 +128,10 @@ type Server struct {
 	ContainerID string
 	GroupKinds  []schema.GroupKind
 
-	conn   *grpc.ClientConn
-	client diffv1alpha1.PlanServiceClient
-	reused bool
+	conn    *grpc.ClientConn
+	client  diffv1alpha1.PlanServiceClient
+	reused  bool
+	cleanup Cleanup
 }
 
 // Skipped records a provider image that does not run a diff server this run,
@@ -86,13 +143,14 @@ type Skipped struct {
 }
 
 // Input describes one provider package to run as a diff server. The zero
-// values of PublishAddress and Target mean the manager's defaults apply; set
-// them to override Docker addressing for this provider only, the way render's
-// per-function runtime annotations do.
+// values mean the manager's defaults apply; set them to override Docker
+// behavior for this provider only, the way render's per-function runtime
+// annotations do.
 type Input struct {
 	Image          string
 	PublishAddress netip.Addr
 	Target         string
+	Cleanup        Cleanup
 }
 
 // containerRuntime is the slice of internal/docker the manager uses,
@@ -111,9 +169,9 @@ type Manager struct {
 	pkgs         runtimexpkg.Client
 	rt           containerRuntime
 	log          logging.Logger
-	keep         bool
 	readyTimeout time.Duration
 	publishAddr  netip.Addr
+	session      string
 
 	mu      sync.Mutex
 	routes  map[schema.GroupKind]*Server
@@ -123,12 +181,6 @@ type Manager struct {
 // Option configures a Manager.
 type Option func(*Manager)
 
-// WithKeepServers leaves diff server containers running when the manager
-// stops, so later runs find and reuse them by name.
-func WithKeepServers(keep bool) Option {
-	return func(m *Manager) { m.keep = keep }
-}
-
 // WithContainerRuntime replaces the container runtime, for testing.
 func WithContainerRuntime(rt containerRuntime) Option {
 	return func(m *Manager) { m.rt = rt }
@@ -137,6 +189,13 @@ func WithContainerRuntime(rt containerRuntime) Option {
 // WithReadyTimeout sets how long to wait for a started diff server to answer.
 func WithReadyTimeout(d time.Duration) Option {
 	return func(m *Manager) { m.readyTimeout = d }
+}
+
+// WithSessionID sets the session label value for the containers the manager
+// creates, so callers orchestrating a larger run can scope cleanup to it.
+// Empty means a random per-process ID, matching render's session labels.
+func WithSessionID(session string) Option {
+	return func(m *Manager) { m.session = session }
 }
 
 // NewManager returns a Manager that fetches provider packages with pkgs and
@@ -235,22 +294,31 @@ func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
 		runImage = image
 	}
 
-	// The manager's loopback default is overridable per provider: Input
-	// carries the publish and target addresses from the provider manifest's
-	// runtime annotations, the way render's per-function annotations work.
+	// The manager's defaults are overridable per provider: Input carries the
+	// publish and target addresses and the cleanup policy from the provider
+	// manifest's runtime annotations, the way render's per-function
+	// annotations work.
 	publishAddr := m.publishAddr
 	if in.PublishAddress.IsValid() {
 		publishAddr = in.PublishAddress
 	}
+	cleanup := in.Cleanup
+	if cleanup == "" {
+		cleanup = CleanupRemove
+	}
 
-	id, reused, err := m.ensureContainer(ctx, containerName(pkg.Digest), runImage, publishAddr)
+	labels := managedLabels(m.session)
+	labels[LabelKeyCleanup] = string(cleanup)
+
+	id, reused, err := m.ensureContainer(ctx, containerName(pkg.Digest), runImage, publishAddr, labels)
 	if err != nil {
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot start diff server container: %s", err)}
 	}
 
 	server, err := m.connect(ctx, id, image, in.Target)
 	if err != nil {
-		if !reused && !m.keep {
+		// An orphaned container is left behind even on failure, for debugging.
+		if !reused && cleanup != CleanupOrphan {
 			if serr := m.rt.StopContainerByID(ctx, id); serr != nil {
 				m.log.Info("Cannot clean up failed diff server container", "container", id, "err", serr)
 			}
@@ -260,13 +328,14 @@ func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
 
 	server.GroupKinds = gks
 	server.reused = reused
-	m.log.Debug("Diff server ready", "image", image, "address", server.Address, "reused", reused)
+	server.cleanup = cleanup
+	m.log.Debug("Diff server ready", "image", image, "address", server.Address, "reused", reused, "cleanup", cleanup)
 	return server, nil
 }
 
 // ensureContainer finds a live container with the deterministic name for this
 // package digest and reuses it, or starts a new one.
-func (m *Manager) ensureContainer(ctx context.Context, name, image string, publishAddr netip.Addr) (id string, reused bool, err error) {
+func (m *Manager) ensureContainer(ctx context.Context, name, image string, publishAddr netip.Addr, labels map[string]string) (id string, reused bool, err error) {
 	id, found, running, err := m.rt.GetRunningContainerIDByName(ctx, name)
 	if err != nil {
 		return "", false, err
@@ -284,6 +353,7 @@ func (m *Manager) ensureContainer(ctx context.Context, name, image string, publi
 		// --debug precedes the subcommand: it is the provider's global flag.
 		docker.StartWithCommand([]string{"--debug", "internal", "diff-server", "--address", fmt.Sprintf(":%d", containerPort)}),
 		docker.StartWithPublishedPort(publishAddr, containerPort),
+		docker.StartWithLabels(labels),
 	)
 	return id, false, err
 }
@@ -368,9 +438,9 @@ func (m *Manager) Servers() []*Server {
 	return append([]*Server(nil), m.servers...)
 }
 
-// Stop closes connections and tears down containers. With keep set the
-// containers stay running so the next run finds them by name and skips
-// startup.
+// Stop closes connections and tears down containers according to each
+// server's cleanup policy: Remove tears the container down, Orphan leaves it
+// running so the next run finds it by name and skips startup.
 func (m *Manager) Stop(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -380,7 +450,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
-		if m.keep {
+		if s.cleanup == CleanupOrphan {
 			continue
 		}
 		if err := m.rt.StopContainerByID(ctx, s.ContainerID); err != nil {

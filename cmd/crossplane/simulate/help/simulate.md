@@ -33,9 +33,12 @@ cluster with your kubeconfig and RBAC, and the diff servers run locally with
 no credentials and no cluster access.
 
 Diff server startup takes a few seconds per provider image. In an
-edit-simulate-edit loop, --keep-diff-servers leaves the containers running so
-the next run reuses them; they are named `crossplane-diff-server-DIGEST` and
-are cleaned up by any later run without the flag, or manually with docker rm.
+edit-simulate-edit loop, annotate a provider manifest with
+`simulate.crossplane.io/runtime-docker-cleanup: Orphan` (like render's
+per-function cleanup annotation) to leave its container running so the next
+run reuses it; containers are named `crossplane-diff-server-DIGEST`, carry
+`simulate.crossplane.io/managed-by` and session labels, and are cleaned up by
+any later run without the annotation, or manually with docker rm.
 
 ## Examples
 
@@ -52,10 +55,11 @@ from a checked-in file of Provider manifests:
 crossplane resource simulate -f resources.yaml --providers providers.yaml
 ```
 
-Keep diff servers running for faster subsequent runs:
+Keep diff servers running for faster subsequent runs, via a provider manifest
+annotated with `simulate.crossplane.io/runtime-docker-cleanup: Orphan`:
 
 ```shell
-crossplane resource simulate -f resources.yaml --keep-diff-servers
+crossplane resource simulate -f resources.yaml --providers providers.yaml
 ```
 
 Emit machine-readable results for CI gating:

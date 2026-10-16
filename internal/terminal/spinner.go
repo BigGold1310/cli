@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	bspinner "charm.land/bubbles/v2/spinner"
@@ -48,17 +49,17 @@ func ttyInput() io.Reader {
 }
 
 // interruptKey handles ctrl+c for a spinner program with a TTY attached: raw
-// mode swallows SIGINT, so the key arrives as input and must mirror what the
-// signal handler does for external signals.
-func interruptKey(p *tea.Program, msg tea.Msg) {
+// mode swallows the terminal's SIGINT, so the key arrives as input and must
+// be re-raised as the signal it stands for. Main's signal.NotifyContext then
+// cancels the command context, in-flight work unwinds, and deferred cleanup
+// runs, exactly as for an external signal. Exiting here instead would skip
+// that cleanup.
+func interruptKey(msg tea.Msg) {
 	k, ok := msg.(tea.KeyPressMsg)
 	if !ok || k.String() != "ctrl+c" {
 		return
 	}
-	if p != nil {
-		_ = p.ReleaseTerminal()
-	}
-	os.Exit(130)
+	_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
 }
 
 // SpinnerPrinter prints spinners to the console.
@@ -236,7 +237,7 @@ func (m *MultiSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	interruptKey(m.program, msg)
+	interruptKey(msg)
 
 	if _, ok := msg.(tickMsg); !ok {
 		return m, nil
@@ -379,7 +380,7 @@ func (ss *SuccessSpinner) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 
-	interruptKey(ss.program, msg)
+	interruptKey(msg)
 
 	if _, ok := msg.(tickMsg); !ok {
 		return ss, nil

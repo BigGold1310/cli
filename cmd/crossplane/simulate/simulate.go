@@ -75,20 +75,26 @@ const (
 	// provider's diff server when it differs from the publish address, e.g.
 	// with a VM-based or remote Docker daemon.
 	AnnotationKeyDockerTarget = "simulate.crossplane.io/runtime-docker-target"
+
+	// AnnotationKeyDockerCleanup configures how a provider's diff server
+	// container is cleaned up once the run is done: Remove (the default)
+	// tears it down, Orphan leaves it running so later runs reuse it without
+	// paying startup.
+	AnnotationKeyDockerCleanup = "simulate.crossplane.io/runtime-docker-cleanup"
 )
 
 // Cmd previews what applying managed resources would do.
 type Cmd struct {
 	Filename string `help:"YAML file(s) or directory with managed resources, or '-' for stdin (comma-separated)." predictor:"yaml_file_or_directory" required:"" short:"f"`
 
-	Providers       string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                                    optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
-	ImageConfigs    string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                                optional:""                                     predictor:"yaml_file"              type:"existingfile"`
-	ProjectFile     string        `default:"${project_file}"                                                                                                                                             help:"Path to a project definition file to read imageConfigs from." name:"project-file"`
-	KeepDiffServers bool          `help:"Leave diff server containers running for reuse by later runs."                                                                                                  name:"keep-diff-servers"`
-	Context         string        `default:""                                                                                                                                                            help:"Kubernetes context."                                          name:"context"                                  predictor:"context"                short:"c"`
-	CacheDir        string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages."            name:"cache-dir"                                predictor:"directory"`
-	Timeout         time.Duration `default:"2m"                                                                                                                                                          help:"Per-resource plan timeout."`
-	Output          string        `default:"plan"                                                                                                                                                        enum:"plan,json,yaml"                                               help:"Output format. One of: plan, json, yaml." name:"output"                      short:"o"`
+	Providers    string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                                    optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
+	ImageConfigs string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                                optional:""                                     predictor:"yaml_file"              type:"existingfile"`
+	ProjectFile  string        `default:"${project_file}"                                                                                                                                             help:"Path to a project definition file to read imageConfigs from." name:"project-file"`
+	SessionID    string        `help:"Session ID to apply as the simulate.crossplane.io/session label on diff server containers. Defaults to a random per-process ID."                                placeholder:"ID"`
+	Context      string        `default:""                                                                                                                                                            help:"Kubernetes context."                                          name:"context"                                  predictor:"context"                short:"c"`
+	CacheDir     string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages."            name:"cache-dir"                                predictor:"directory"`
+	Timeout      time.Duration `default:"2m"                                                                                                                                                          help:"Per-resource plan timeout."`
+	Output       string        `default:"plan"                                                                                                                                                        enum:"plan,json,yaml"                                               help:"Output format. One of: plan, json, yaml." name:"output"                      short:"o"`
 
 	Impersonation kube.ImpersonationFlags `embed:""`
 }
@@ -110,10 +116,10 @@ func (c *Cmd) AfterApply() error {
 	return nil
 }
 
-// Run runs the simulate command.
-func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPrinter) error {
-	ctx := context.Background()
-
+// Run runs the simulate command. ctx is the signal-bound command context from
+// main: cancellation on SIGINT/SIGTERM unwinds in-flight plans so the
+// deferred diff server cleanup runs.
+func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, sp terminal.SpinnerPrinter) error {
 	loader, err := load.NewLoader(c.Filename)
 	if err != nil {
 		return errors.Wrapf(err, "cannot load resources from %q", c.Filename)
@@ -167,7 +173,7 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPri
 		return errors.Wrap(err, "cannot create package client")
 	}
 
-	mgr := diffserver.NewManager(pkgClient, logger, diffserver.WithKeepServers(c.KeepDiffServers))
+	mgr := diffserver.NewManager(pkgClient, logger, diffserver.WithSessionID(c.SessionID))
 	var skipped []diffserver.Skipped
 	if err := sp.WrapWithSuccessSpinner("Starting provider diff servers", func() error {
 		var err error
@@ -176,8 +182,10 @@ func (c *Cmd) Run(k *kong.Context, logger logging.Logger, sp terminal.SpinnerPri
 	}); err != nil {
 		return errors.Wrap(err, "cannot start diff servers")
 	}
+	// Cleanup runs even when ctx was cancelled by a signal, so an interrupted
+	// run still tears its containers down.
 	defer func() {
-		if err := mgr.Stop(context.Background()); err != nil {
+		if err := mgr.Stop(context.WithoutCancel(ctx)); err != nil {
 			_, _ = fmt.Fprintf(k.Stderr, "Warning: cannot clean up diff servers: %s\n", err)
 		}
 	}()
@@ -247,6 +255,13 @@ func loadProviderInputs(path string) ([]diffserver.Input, error) {
 			}
 		}
 		in.Target = annotations[AnnotationKeyDockerTarget]
+		switch cleanup := diffserver.Cleanup(annotations[AnnotationKeyDockerCleanup]); cleanup {
+		case diffserver.CleanupRemove, diffserver.CleanupOrphan, "":
+			in.Cleanup = cleanup
+		default:
+			return nil, errors.Errorf("provider %q has an invalid %s annotation %q: must be %s or %s",
+				o.GetName(), AnnotationKeyDockerCleanup, cleanup, diffserver.CleanupRemove, diffserver.CleanupOrphan)
+		}
 		inputs = append(inputs, in)
 	}
 	return inputs, nil

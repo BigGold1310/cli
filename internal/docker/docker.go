@@ -270,6 +270,16 @@ func StartWithCopyFiles(tarball []byte, path string) StartContainerOption {
 	}
 }
 
+// StartWithLabels adds labels to the container.
+func StartWithLabels(labels map[string]string) StartContainerOption {
+	return func(cfg *startContainerConfig) {
+		if cfg.containerConfig.Labels == nil {
+			cfg.containerConfig.Labels = map[string]string{}
+		}
+		maps.Copy(cfg.containerConfig.Labels, labels)
+	}
+}
+
 // StartWithPublishedPort publishes the container's TCP containerPort on an
 // ephemeral port on hostIP; the engine allocates the host port. Use
 // GetHostPort after the container starts to learn the allocated address.

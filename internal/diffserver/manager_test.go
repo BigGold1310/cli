@@ -300,18 +300,18 @@ func TestManagerStart(t *testing.T) {
 		}
 	})
 
-	t.Run("KeepLeavesContainersRunning", func(t *testing.T) {
+	t.Run("OrphanCleanupLeavesContainersRunning", func(t *testing.T) {
 		rt := &fakeRuntime{addr: servePlanService(t)}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt), WithKeepServers(true))
+		m := NewManager(pkgs, log, WithContainerRuntime(rt))
 
-		if _, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"})); err != nil {
+		if _, err := m.Start(ctx, []Input{{Image: "xpkg.example.org/provider-aws-ec2:v2.9.0", Cleanup: CleanupOrphan}}); err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
 		if err := m.Stop(ctx); err != nil {
 			t.Fatalf("Stop(...): unexpected error: %v", err)
 		}
 		if len(rt.stopped) != 0 {
-			t.Errorf("Stop(...): want containers left running with keep, got stops %v", rt.stopped)
+			t.Errorf("Stop(...): want containers left running with the Orphan cleanup policy, got stops %v", rt.stopped)
 		}
 	})
 

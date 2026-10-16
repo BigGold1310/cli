@@ -290,7 +290,7 @@ type simulateCmd struct {
 	Providers      string        `help:"Provider manifests to run as diff servers, overriding cluster discovery."`
 	IncludePinned  bool          `help:"Also simulate XRs pinned to older composition revisions."`
 	SkipPlan        bool         `help:"Skip the cloud-layer plan; show only the cluster-layer diff."`
-	KeepDiffServers bool         `help:"Leave diff server containers running for reuse by later runs."`
+	SessionID       string       `help:"Session label for the containers this run creates."`
 	MaxIterations  uint          `default:"10" help:"Cap on requirement resolution passes per XR."`
 	Timeout        time.Duration `default:"2m" help:"Per XR render and plan timeout."`
 	MaxConcurrency uint          `default:"8" help:"XRs simulated concurrently."`
@@ -350,15 +350,16 @@ read.
 Startup is the one cost that hurts across runs: a diff server takes a few
 seconds to come up, and an edit-simulate-edit loop pays that on every run
 if containers are torn down at exit. So containers get deterministic
-names derived from the provider image digest, and `--keep-diff-servers`
-leaves them running when the command exits: the next run finds a live
-server with a matching name and reuses it instead of starting a new one.
-Because the name carries the digest, a changed image never matches a
+names derived from the provider image digest, and a provider manifest
+annotated `simulate.crossplane.io/runtime-docker-cleanup: Orphan`, the same
+cleanup policy render's function containers take through their annotation,
+leaves its container running when the command exits: the next run finds a
+live server with a matching name and reuses it instead of starting a new
+one. Because the name carries the digest, a changed image never matches a
 stale server, and leftovers are easy to find and remove since they all
-follow one naming scheme. The default stays clean, start and tear down
-per run; the flag is for the loops where those seconds add up. The same
-naming convention is worth extending to render's function containers,
-but that belongs to render.
+follow one naming scheme and carry render-style managed-by and session
+labels. The default stays clean, start and tear down per run; Orphan is
+for the loops where those seconds add up.
 
 ### From Response to Printed Diff
 
@@ -510,7 +511,7 @@ The protocol carries one resource per unary request; a fleet preview is
 many small requests, each cheap.
 Diff-server startup is the dominant fixed cost, a few seconds per distinct
 provider image, paid once per run and torn down after, or paid once across
-many runs with `--keep-diff-servers`. Nothing simulate does
+many runs with the Orphan cleanup policy. Nothing simulate does
 writes to the cluster or the cloud: reads plus dry-runs on one side, a
 credential-free diff on the other.
 
