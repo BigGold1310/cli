@@ -258,9 +258,7 @@ func pushImages(logger logging.Logger, sp terminal.SpinnerPrinter, images []pack
 	}
 
 	if sp != nil {
-		if err := sp.WrapWithSuccessSpinner("Pushing packages", func() error {
-			return g.Wait()
-		}); err != nil {
+		if err := sp.WrapWithSuccessSpinner("Pushing packages", g.Wait); err != nil {
 			return err
 		}
 	} else if err := g.Wait(); err != nil {
