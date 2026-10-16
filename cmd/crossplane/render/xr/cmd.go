@@ -52,9 +52,6 @@ import (
 	"github.com/crossplane/cli/v2/internal/project"
 	"github.com/crossplane/cli/v2/internal/project/functions"
 	"github.com/crossplane/cli/v2/internal/project/projectfile"
-	"github.com/crossplane/cli/v2/internal/schemas/generator"
-	"github.com/crossplane/cli/v2/internal/schemas/manager"
-	"github.com/crossplane/cli/v2/internal/schemas/runner"
 	"github.com/crossplane/cli/v2/internal/terminal"
 	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 	xrpkg "github.com/crossplane/cli/v2/pkg/xr"
@@ -474,14 +471,8 @@ func (c *Cmd) loadFunctionsFromProject(ctx context.Context, log logging.Logger, 
 		return nil, err
 	}
 
-	generators := generator.AllLanguages(
-		generator.WithGoModelAccessors(cfg.Features.GenerateGoModelAccessors),
-		generator.WithGoRuntimeObjects(cfg.Features.GenerateGoRuntimeObjects),
-	)
-
 	depMgr := dependency.NewManager(proj, projFS,
 		dependency.WithProjectFile(projFileName),
-		dependency.WithSchemaGenerators(generators),
 		dependency.WithXpkgClient(xpkgClient),
 		dependency.WithResolver(resolver),
 	)
@@ -496,9 +487,7 @@ func (c *Cmd) loadFunctionsFromProject(ctx context.Context, log logging.Logger, 
 	}
 
 	if err := sp.WrapAsyncWithSuccessSpinners(func(ch async.EventChannel) error {
-		schemasFS := afero.NewBasePathFs(projFS, proj.Spec.Paths.Schemas)
-		schemaRunner := runner.NewRealSchemaRunner(runner.WithImageConfig(proj.Spec.ImageConfigs))
-		schemaMgr := manager.New(schemasFS, generators, schemaRunner)
+		schemaMgr := project.NewSchemaManager(proj, projFS, cfg.Features)
 
 		tempDir, err := os.MkdirTemp("", "crossplane-build-")
 		if err != nil {

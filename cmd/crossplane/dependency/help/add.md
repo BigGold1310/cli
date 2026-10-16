@@ -1,6 +1,7 @@
 The `dependency add` command adds a dependency to a Crossplane Project metadata
-file and generates language bindings (schemas) for the dependency package's
-CRDs.
+file. It checks that the dependency can be fetched, and caches packages. It
+doesn't generate language bindings (schemas); run `crossplane schema update`
+afterwards to generate them for the dependency's CRDs.
 
 ## Dependency types
 
@@ -21,37 +22,36 @@ Non-xpkg dependencies are always build-time dependencies.
 
 ## Examples
 
-Retrieve the latest available semantic version of `provider-aws-eks`, generate
-schemas for its CRDs, and add it to the project as a runtime dependency:
+Retrieve the latest available semantic version of `provider-aws-eks` and add it
+to the project as a runtime dependency:
 
 ```shell
 crossplane dependency add xpkg.crossplane.io/crossplane-contrib/provider-aws-eks
 ```
 
 Retrieve the latest available version greater than `v1.1.0` of
-`provider-gcp-storage`, generate schemas for its CRDs, and add it to the project
-as a build-time only dependency:
+`provider-gcp-storage` and add it to the project as a build-time only
+dependency:
 
 ```shell
 crossplane dependency add --api-only 'xpkg.crossplane.io/crossplane-contrib/provider-gcp-storage:>v1.1.0'
 ```
 
-Generate schemas for the core resources from Kubernetes v1.33.0 and add it to
-the project as a build-time dependency:
+Add the core resources from Kubernetes v1.33.0 to the project as a build-time
+dependency:
 
 ```shell
 crossplane dependency add k8s:v1.33.0
 ```
 
-Generate schemas for a specific CRD from an HTTP URL and add it to the project
-as a build-time dependency:
+Add a specific CRD from an HTTP URL to the project as a build-time dependency:
 
 ```shell
 crossplane dependency add https://raw.githubusercontent.com/cert-manager/cert-manager/refs/heads/master/deploy/crds/cert-manager.io_certificaterequests.yaml
 ```
 
-Generate schemas for CRDs from a specific subdirectory of a git repository and
-add it to the project as a build-time dependency:
+Add CRDs from a specific subdirectory of a git repository to the project as a
+build-time dependency:
 
 ```shell
 crossplane dependency add https://github.com/kubernetes-sigs/cluster-api \

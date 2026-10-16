@@ -18,22 +18,17 @@ package dependency
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/spf13/afero"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 
 	"github.com/crossplane/cli/v2/apis/dev/v1alpha1"
-	"github.com/crossplane/cli/v2/internal/config"
 	"github.com/crossplane/cli/v2/internal/dependency"
 	"github.com/crossplane/cli/v2/internal/project/projectfile"
-	"github.com/crossplane/cli/v2/internal/schemas/generator"
 	"github.com/crossplane/cli/v2/internal/terminal"
-	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 
 	_ "embed"
 )
@@ -58,48 +53,18 @@ func (c *addCmd) Help() string {
 }
 
 // Run executes the add command.
-func (c *addCmd) Run(logger logging.Logger, sp terminal.SpinnerPrinter, cfg *config.Config) error {
+func (c *addCmd) Run(logger logging.Logger, sp terminal.SpinnerPrinter) error {
 	ctx := context.Background()
 
-	projFilePath, err := filepath.Abs(c.ProjectFile)
-	if err != nil {
-		return err
-	}
-	projDirPath := filepath.Dir(projFilePath)
-	projFS := afero.NewBasePathFs(afero.NewOsFs(), projDirPath)
-
-	proj, err := projectfile.Parse(projFS, filepath.Base(c.ProjectFile))
+	proj, projFS, err := projectfile.Load(c.ProjectFile)
 	if err != nil {
 		return err
 	}
 
-	cacheDir := c.CacheDir
-	if cacheDir == "" {
-		cacheDir = dependency.DefaultCacheDir()
-	}
-
-	client, err := clixpkg.NewClient(
-		clixpkg.NewRemoteFetcher(),
-		clixpkg.WithCacheDir(afero.NewOsFs(), cacheDir),
-		clixpkg.WithImageConfigs(proj.Spec.ImageConfigs),
-	)
+	m, err := dependency.NewCachedManager(proj, projFS, c.ProjectFile, c.CacheDir)
 	if err != nil {
 		return err
 	}
-	resolver := clixpkg.NewResolver(client)
-
-	m := dependency.NewManager(proj, projFS,
-		dependency.WithProjectFile(c.ProjectFile),
-		dependency.WithSchemaGenerators(generator.Filter(
-			generator.AllLanguages(
-				generator.WithGoModelAccessors(cfg.Features.GenerateGoModelAccessors),
-				generator.WithGoRuntimeObjects(cfg.Features.GenerateGoRuntimeObjects),
-			),
-			proj.Spec.Schemas.GetLanguages(),
-		)),
-		dependency.WithXpkgClient(client),
-		dependency.WithResolver(resolver),
-	)
 
 	dep, err := c.buildDependency()
 	if err != nil {
