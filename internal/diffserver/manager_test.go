@@ -18,14 +18,20 @@ package diffserver
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/containerd/errdefs"
 	diffv1alpha1 "github.com/crossplane/upjet/v2/proto/diff/v1alpha1"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -35,7 +41,7 @@ import (
 	runtimexpkg "github.com/crossplane/crossplane-runtime/v2/pkg/xpkg"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/xpkg/parser"
 
-	"github.com/crossplane/cli/v2/internal/docker"
+	"github.com/crossplane/cli/v2/internal/containerruntime/fake"
 )
 
 const (
@@ -152,48 +158,76 @@ func (f *fakePkgClient) ListVersions(_ context.Context, _ string, _ ...runtimexp
 	return nil, nil
 }
 
-// fakeRuntime fakes container lifecycle, pointing every container at addr.
-type fakeRuntime struct {
+// fakeDocker fakes container lifecycle at the Docker client level, publishing
+// every container's diff server port on addr.
+type fakeDocker struct {
 	mu       sync.Mutex
-	addr     string
-	existing map[string]fakeContainer // name -> container
-	started  []string                 // names passed to StartContainer
-	stopped  []string                 // ids passed to StopContainerByID
+	addr     string            // host:port every container's port binds to
+	existing map[string]string // name -> id of pre-existing containers
+	known    map[string]bool   // ids inspect resolves port bindings for
+	created  []string          // names passed to ContainerCreate
+	stopped  []string          // ids passed to ContainerStop
+	removed  []string          // ids passed to ContainerRemove
 }
 
-type fakeContainer struct {
-	id      string
-	running bool
-}
-
-func (f *fakeRuntime) StartContainer(_ context.Context, name, _ string, _ ...docker.StartContainerOption) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.started = append(f.started, name)
-	return "new-" + name, nil
-}
-
-func (f *fakeRuntime) StopContainerByID(_ context.Context, id string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stopped = append(f.stopped, id)
-	return nil
-}
-
-func (f *fakeRuntime) StartContainerByID(_ context.Context, _ string) error { return nil }
-
-func (f *fakeRuntime) GetRunningContainerIDByName(_ context.Context, name string) (string, bool, bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	c, ok := f.existing[name]
-	if !ok {
-		return "", false, false, nil
+func newFakeDocker(addr string, existing map[string]string) *fakeDocker {
+	f := &fakeDocker{addr: addr, existing: existing, known: map[string]bool{}}
+	for _, id := range existing {
+		f.known[id] = true
 	}
-	return c.id, true, c.running, nil
+	return f
 }
 
-func (f *fakeRuntime) GetHostPort(_ context.Context, _ string, _ int) (string, error) {
-	return f.addr, nil
+func (f *fakeDocker) client() *fake.Client {
+	return &fake.Client{
+		MockContainerInspect: func(_ context.Context, ref string, _ client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if id, ok := f.existing[ref]; ok {
+				return client.ContainerInspectResult{Container: container.InspectResponse{ID: id}}, nil
+			}
+			if f.known[ref] {
+				host, port, err := net.SplitHostPort(f.addr)
+				if err != nil {
+					return client.ContainerInspectResult{}, err
+				}
+				p := network.MustParsePort(fmt.Sprintf("%d/tcp", containerPort))
+				return client.ContainerInspectResult{Container: container.InspectResponse{
+					ID: ref,
+					NetworkSettings: &container.NetworkSettings{
+						Ports: network.PortMap{p: []network.PortBinding{{
+							HostIP:   netip.MustParseAddr(host),
+							HostPort: port,
+						}}},
+					},
+				}}, nil
+			}
+			return client.ContainerInspectResult{}, errdefs.ErrNotFound
+		},
+		MockContainerCreate: func(_ context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			id := "new-" + options.Name
+			f.created = append(f.created, options.Name)
+			f.known[id] = true
+			return client.ContainerCreateResult{ID: id}, nil
+		},
+		MockContainerStart: func(_ context.Context, _ string, _ client.ContainerStartOptions) (client.ContainerStartResult, error) {
+			return client.ContainerStartResult{}, nil
+		},
+		MockContainerStop: func(_ context.Context, id string, _ client.ContainerStopOptions) (client.ContainerStopResult, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.stopped = append(f.stopped, id)
+			return client.ContainerStopResult{}, nil
+		},
+		MockContainerRemove: func(_ context.Context, id string, _ client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.removed = append(f.removed, id)
+			return client.ContainerRemoveResult{}, nil
+		},
+	}
 }
 
 // readyServer serves a real PlanService on a loopback listener that answers
@@ -230,8 +264,8 @@ func TestManagerStart(t *testing.T) {
 	}}
 
 	t.Run("NoCapabilitySkipsWithoutStarting", func(t *testing.T) {
-		rt := &fakeRuntime{}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt))
+		fd := newFakeDocker("", nil)
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
 		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-s3:v2.9.0"}))
 		if err != nil {
@@ -240,14 +274,14 @@ func TestManagerStart(t *testing.T) {
 		if len(skipped) != 1 || !strings.Contains(skipped[0].Reason, "DiffServer capability") {
 			t.Errorf("Start(...): want one capability skip, got %+v", skipped)
 		}
-		if len(rt.started) != 0 {
+		if len(fd.created) != 0 {
 			t.Errorf("Start(...): no container should start for a package without the capability")
 		}
 	})
 
 	t.Run("RoutesBuiltFromPackageCRDs", func(t *testing.T) {
-		rt := &fakeRuntime{addr: servePlanService(t)}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt))
+		fd := newFakeDocker(servePlanService(t), nil)
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
 		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil {
@@ -270,39 +304,36 @@ func TestManagerStart(t *testing.T) {
 		}
 
 		wantName := containerPrefix + "0123456789ab"
-		if len(rt.started) != 1 || rt.started[0] != wantName {
-			t.Errorf("Start(...): want container %q started, got %v", wantName, rt.started)
+		if len(fd.created) != 1 || fd.created[0] != wantName {
+			t.Errorf("Start(...): want container %q started, got %v", wantName, fd.created)
 		}
 
 		if err := m.Stop(ctx); err != nil {
 			t.Fatalf("Stop(...): unexpected error: %v", err)
 		}
-		if len(rt.stopped) != 1 {
-			t.Errorf("Stop(...): want the container stopped, got %v", rt.stopped)
+		if len(fd.removed) != 1 {
+			t.Errorf("Stop(...): want the container removed, got %v", fd.removed)
 		}
 	})
 
-	t.Run("ReusesRunningContainerByName", func(t *testing.T) {
-		rt := &fakeRuntime{
-			addr: servePlanService(t),
-			existing: map[string]fakeContainer{
-				containerPrefix + "0123456789ab": {id: "existing-id", running: true},
-			},
-		}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt))
+	t.Run("ReusesContainerByName", func(t *testing.T) {
+		fd := newFakeDocker(servePlanService(t), map[string]string{
+			containerPrefix + "0123456789ab": "existing-id",
+		})
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
 		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil || len(skipped) != 0 {
 			t.Fatalf("Start(...): unexpected error or skips: %v %+v", err, skipped)
 		}
-		if len(rt.started) != 0 {
-			t.Errorf("Start(...): want the existing container reused, got new containers %v", rt.started)
+		if len(fd.created) != 0 {
+			t.Errorf("Start(...): want the existing container reused, got new containers %v", fd.created)
 		}
 	})
 
 	t.Run("OrphanCleanupLeavesContainersRunning", func(t *testing.T) {
-		rt := &fakeRuntime{addr: servePlanService(t)}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt))
+		fd := newFakeDocker(servePlanService(t), nil)
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
 		if _, err := m.Start(ctx, []Input{{Image: "xpkg.example.org/provider-aws-ec2:v2.9.0", Cleanup: CleanupOrphan}}); err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
@@ -310,8 +341,8 @@ func TestManagerStart(t *testing.T) {
 		if err := m.Stop(ctx); err != nil {
 			t.Fatalf("Stop(...): unexpected error: %v", err)
 		}
-		if len(rt.stopped) != 0 {
-			t.Errorf("Stop(...): want containers left running with the Orphan cleanup policy, got stops %v", rt.stopped)
+		if len(fd.stopped) != 0 || len(fd.removed) != 0 {
+			t.Errorf("Stop(...): want containers left running with the Orphan cleanup policy, got stops %v removes %v", fd.stopped, fd.removed)
 		}
 	})
 
@@ -323,8 +354,8 @@ func TestManagerStart(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = lis.Close() })
 
-		rt := &fakeRuntime{addr: lis.Addr().String()}
-		m := NewManager(pkgs, log, WithContainerRuntime(rt), WithReadyTimeout(700*time.Millisecond))
+		fd := newFakeDocker(lis.Addr().String(), nil)
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()), WithReadyTimeout(700*time.Millisecond))
 
 		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
 		if err != nil {
@@ -333,8 +364,8 @@ func TestManagerStart(t *testing.T) {
 		if len(skipped) != 1 || !strings.Contains(skipped[0].Reason, "ready") {
 			t.Errorf("Start(...): want a readiness skip, got %+v", skipped)
 		}
-		if len(rt.stopped) != 1 {
-			t.Errorf("Start(...): want the unready container cleaned up, got stops %v", rt.stopped)
+		if len(fd.removed) != 1 {
+			t.Errorf("Start(...): want the unready container cleaned up, got removes %v", fd.removed)
 		}
 	})
 }

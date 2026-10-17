@@ -52,6 +52,7 @@ import (
 	pkgv1beta1 "github.com/crossplane/crossplane/apis/v2/pkg/v1beta1"
 
 	"github.com/crossplane/cli/v2/cmd/crossplane/common/load"
+	"github.com/crossplane/cli/v2/internal/containerruntime"
 	"github.com/crossplane/cli/v2/internal/diffserver"
 	"github.com/crossplane/cli/v2/internal/docker"
 	"github.com/crossplane/cli/v2/internal/kube"
@@ -88,14 +89,14 @@ const (
 type Cmd struct {
 	Filename string `help:"YAML files or directory with managed resources, or '-' for stdin (comma-separated)." predictor:"yaml_file_or_directory" required:"" short:"f"`
 
-	Providers    string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                                    optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
-	ImageConfigs string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                                optional:""                                     predictor:"yaml_file"              type:"existingfile"`
-	ProjectFile  string        `help:"Path to a project definition file to read imageConfigs from. Defaults to ${project_file} when present."                                                          name:"project-file"                                                 optional:""`
+	Providers    string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                         optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
+	ImageConfigs string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                     optional:""                                     predictor:"yaml_file"              type:"existingfile"`
+	ProjectFile  string        `help:"Path to a project definition file to read imageConfigs from. Defaults to ${project_file} when present."                                                         name:"project-file"                                      optional:""`
 	SessionID    string        `help:"Session ID to apply as the simulate.crossplane.io/session label on diff server containers. Defaults to a random per-process ID."                                placeholder:"ID"`
-	Context      string        `default:""                                                                                                                                                            help:"Kubernetes context."                                          name:"context"                                  predictor:"context"                short:"c"`
-	CacheDir     string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages."            name:"cache-dir"                                predictor:"directory"`
+	Context      string        `default:""                                                                                                                                                            help:"Kubernetes context."                               name:"context"                                  predictor:"context"                short:"c"`
+	CacheDir     string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages." name:"cache-dir"                                predictor:"directory"`
 	Timeout      time.Duration `default:"2m"                                                                                                                                                          help:"Per-resource plan timeout."`
-	Output       string        `default:"plan"                                                                                                                                                        enum:"plan,json,yaml"                                               help:"Output format. One of: plan, json, yaml." name:"output"                      short:"o"`
+	Output       string        `default:"plan"                                                                                                                                                        enum:"plan,json,yaml"                                    help:"Output format. One of: plan, json, yaml." name:"output"                      short:"o"`
 
 	Impersonation kube.ImpersonationFlags `embed:""`
 }
@@ -231,7 +232,7 @@ func (c *Cmd) imageConfigs() ([]pkgv1beta1.ImageConfig, error) {
 		if explicit {
 			return nil, errors.Wrapf(err, "cannot read project file %q", name)
 		}
-		return nil, nil //nolint:nilerr // Best effort: no project file means no project image configs.
+		return nil, nil // Best effort: no project file means no project image configs.
 	}
 	projFS := afero.NewBasePathFs(afero.NewOsFs(), filepath.Dir(projFilePath))
 	proj, err := projectfile.Parse(projFS, filepath.Base(projFilePath))
@@ -273,6 +274,11 @@ func loadProviderInputs(path string) ([]diffserver.Input, error) {
 		switch cleanup := diffserver.Cleanup(annotations[AnnotationKeyDockerCleanup]); cleanup {
 		case diffserver.CleanupRemove, diffserver.CleanupOrphan, "":
 			in.Cleanup = cleanup
+		case containerruntime.CleanupStop:
+			// Render's Stop policy is deliberately unsupported: a stopped
+			// diff server serves nothing, and restarting one costs nearly as
+			// much as starting it.
+			fallthrough
 		default:
 			return nil, errors.Errorf("provider %q has an invalid %s annotation %q: must be %s or %s",
 				o.GetName(), AnnotationKeyDockerCleanup, cleanup, diffserver.CleanupRemove, diffserver.CleanupOrphan)

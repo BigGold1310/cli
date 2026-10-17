@@ -114,20 +114,20 @@ type Renderer interface {
 func NewRenderer(format string) (Renderer, error) {
 	switch format {
 	case FormatPlan:
-		return PlanRenderer{}, nil
+		return planRenderer{}, nil
 	case FormatJSON:
-		return JSONRenderer{}, nil
+		return jsonRenderer{}, nil
 	case FormatYAML:
-		return YAMLRenderer{}, nil
+		return yamlRenderer{}, nil
 	}
 	return nil, errors.Errorf("unknown output format %q", format)
 }
 
-// JSONRenderer renders the serialized Result as indented JSON.
-type JSONRenderer struct{}
+// jsonRenderer renders the serialized Result as indented JSON.
+type jsonRenderer struct{}
 
 // Render writes the plans to w as JSON.
-func (JSONRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
+func (jsonRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	out, err := json.MarshalIndent(NewResult(plans), "", "  ")
 	if err != nil {
 		return errors.Wrap(err, "cannot marshal plans to JSON")
@@ -136,11 +136,11 @@ func (JSONRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	return err
 }
 
-// YAMLRenderer renders the serialized Result as YAML.
-type YAMLRenderer struct{}
+// yamlRenderer renders the serialized Result as YAML.
+type yamlRenderer struct{}
 
 // Render writes the plans to w as YAML.
-func (YAMLRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
+func (yamlRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	out, err := yaml.Marshal(NewResult(plans))
 	if err != nil {
 		return errors.Wrap(err, "cannot marshal plans to YAML")
@@ -149,12 +149,12 @@ func (YAMLRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	return err
 }
 
-// PlanRenderer renders the human-readable plan format: a header and change
+// planRenderer renders the human-readable plan format: a header and change
 // tree per resource, then a summary with warnings.
-type PlanRenderer struct{}
+type planRenderer struct{}
 
 // Render writes the plans to w in the human-readable plan format.
-func (PlanRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
+func (planRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	for _, p := range plans {
 		_, _ = fmt.Fprintln(w, header(p))
 		if p.Error != "" {

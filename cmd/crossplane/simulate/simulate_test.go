@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +139,26 @@ spec:
 	}
 	if _, err := loadProviderInputs(notAProvider); err == nil {
 		t.Errorf("loadProviderInputs(...): want an error for non-Provider manifests")
+	}
+
+	// Render's Stop cleanup policy is deliberately unsupported for diff
+	// servers, so the annotation that would request it is rejected.
+	stopCleanup := filepath.Join(dir, "stop.yaml")
+	manifest = `---
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-aws-ec2
+  annotations:
+    simulate.crossplane.io/runtime-docker-cleanup: Stop
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-ec2:v2.9.0
+`
+	if err := os.WriteFile(stopCleanup, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("cannot write manifest: %v", err)
+	}
+	if _, err := loadProviderInputs(stopCleanup); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Errorf("loadProviderInputs(...): want an invalid-annotation error for the Stop cleanup policy, got %v", err)
 	}
 }
 

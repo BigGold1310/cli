@@ -24,7 +24,6 @@ package diffserver
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/netip"
 	"strings"
 	"sync"
@@ -36,7 +35,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/rand"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
@@ -44,7 +42,7 @@ import (
 
 	pkgmetav1 "github.com/crossplane/crossplane/apis/v2/pkg/meta/v1"
 
-	"github.com/crossplane/cli/v2/internal/docker"
+	"github.com/crossplane/cli/v2/internal/containerruntime"
 	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 )
 
@@ -68,19 +66,23 @@ const (
 
 // Cleanup is how a diff server container is cleaned up when the manager
 // stops, following render's per-function cleanup policies.
-type Cleanup string
+type Cleanup = containerruntime.Cleanup
 
 const (
 	// CleanupRemove is the default: stop and remove the container.
-	CleanupRemove Cleanup = "Remove"
+	CleanupRemove = containerruntime.CleanupRemove
 
 	// CleanupOrphan leaves the container running, so a later run finds it by
 	// its deterministic name and reuses it without paying startup. Render's
 	// function runtimes support a third policy, Stop; a stopped diff server
 	// serves nothing and restarting costs nearly as much as starting, so
 	// simulate omits it.
-	CleanupOrphan Cleanup = "Orphan"
+	CleanupOrphan = containerruntime.CleanupOrphan
 )
+
+// labelDomain prefixes the labels simulate applies to the Docker containers
+// it creates.
+const labelDomain = "simulate.crossplane.io"
 
 // Labels applied to the Docker containers simulate creates, mirroring
 // render's, so leftovers (a crash, or an Orphan cleanup policy) can be
@@ -88,38 +90,20 @@ const (
 const (
 	// LabelKeyManagedBy is applied to every diff server container. Its value
 	// is always LabelValueManagedBy.
-	LabelKeyManagedBy = "simulate.crossplane.io/managed-by"
+	LabelKeyManagedBy = labelDomain + "/managed-by"
 
 	// LabelValueManagedBy is the value of LabelKeyManagedBy.
-	LabelValueManagedBy = "crossplane-cli"
+	LabelValueManagedBy = containerruntime.LabelValueManagedBy
 
 	// LabelKeySession identifies the run that created a container. Orphaned
 	// containers outlive their session by design; the label records which run
 	// created them.
-	LabelKeySession = "simulate.crossplane.io/session"
+	LabelKeySession = labelDomain + "/session"
 
 	// LabelKeyCleanup records the effective cleanup policy a container was
 	// created with.
-	LabelKeyCleanup = "simulate.crossplane.io/cleanup"
+	LabelKeyCleanup = labelDomain + "/cleanup"
 )
-
-// sessionID returns an identifier unique to this process, matching render's
-// per-process Docker session IDs.
-//
-//nolint:gochecknoglobals // Must be stable for the life of the process.
-var sessionID = sync.OnceValue(func() string { return rand.String(12) })
-
-// managedLabels returns the labels applied to every container the manager
-// creates. An empty session falls back to the per-process session ID.
-func managedLabels(session string) map[string]string {
-	if session == "" {
-		session = sessionID()
-	}
-	return map[string]string{
-		LabelKeyManagedBy: LabelValueManagedBy,
-		LabelKeySession:   session,
-	}
-}
 
 // Server is a running diff server for one provider package.
 type Server struct {
@@ -130,7 +114,7 @@ type Server struct {
 
 	conn    *grpc.ClientConn
 	client  diffv1alpha1.PlanServiceClient
-	reused  bool
+	running *containerruntime.Running
 	cleanup Cleanup
 }
 
@@ -153,21 +137,11 @@ type Input struct {
 	Cleanup        Cleanup
 }
 
-// containerRuntime is the slice of internal/docker the manager uses,
-// extracted so tests can fake container lifecycle.
-type containerRuntime interface {
-	StartContainer(ctx context.Context, name, image string, opts ...docker.StartContainerOption) (string, error)
-	StartContainerByID(ctx context.Context, id string) error
-	StopContainerByID(ctx context.Context, id string) error
-	GetRunningContainerIDByName(ctx context.Context, name string) (id string, found, running bool, err error)
-	GetHostPort(ctx context.Context, id string, port int) (string, error)
-}
-
 // Manager starts diff server containers for provider packages and routes
 // resources to them.
 type Manager struct {
 	pkgs         runtimexpkg.Client
-	rt           containerRuntime
+	cli          containerruntime.Client
 	log          logging.Logger
 	readyTimeout time.Duration
 	publishAddr  netip.Addr
@@ -181,9 +155,11 @@ type Manager struct {
 // Option configures a Manager.
 type Option func(*Manager)
 
-// WithContainerRuntime replaces the container runtime, for testing.
-func WithContainerRuntime(rt containerRuntime) Option {
-	return func(m *Manager) { m.rt = rt }
+// WithDockerClient replaces the Docker client the manager runs containers
+// with, for testing. Nil (the default) means a real client built from the
+// environment.
+func WithDockerClient(cli containerruntime.Client) Option {
+	return func(m *Manager) { m.cli = cli }
 }
 
 // WithReadyTimeout sets how long to wait for a started diff server to answer.
@@ -203,7 +179,6 @@ func WithSessionID(session string) Option {
 func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Manager {
 	m := &Manager{
 		pkgs:         pkgs,
-		rt:           dockerRuntime{},
 		log:          log,
 		readyTimeout: defaultReadyTimeout,
 		publishAddr:  netip.MustParseAddr("127.0.0.1"),
@@ -307,71 +282,43 @@ func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
 		cleanup = CleanupRemove
 	}
 
-	labels := managedLabels(m.session)
-	labels[LabelKeyCleanup] = string(cleanup)
+	ctr := &containerruntime.Container{
+		Image: runImage,
+		Name:  containerName(pkg.Digest),
+		// --debug precedes the subcommand: it is the provider's global flag.
+		Cmd:         []string{"--debug", "internal", "diff-server", "--address", fmt.Sprintf(":%d", containerPort)},
+		Port:        containerPort,
+		Labels:      containerruntime.ContainerLabels(labelDomain, m.session, cleanup),
+		BindAddress: publishAddr.String(),
+		Target:      in.Target,
+		Log:         m.log,
+		Client:      m.cli,
+	}
 
-	id, reused, err := m.ensureContainer(ctx, containerName(pkg.Digest), runImage, publishAddr, labels)
+	running, err := ctr.Start(ctx)
 	if err != nil {
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot start diff server container: %s", err)}
 	}
 
-	server, err := m.connect(ctx, id, image, in.Target)
+	server, err := m.connect(ctx, running, image)
 	if err != nil {
 		// An orphaned container is left behind even on failure, for debugging.
-		if !reused && cleanup != CleanupOrphan {
-			if serr := m.rt.StopContainerByID(ctx, id); serr != nil {
-				m.log.Info("Cannot clean up failed diff server container", "container", id, "err", serr)
+		if !running.Reused && cleanup != CleanupOrphan {
+			if serr := running.Stop(ctx, CleanupRemove); serr != nil {
+				m.log.Info("Cannot clean up failed diff server container", "container", running.ID, "err", serr)
 			}
 		}
 		return nil, &Skipped{Image: image, Reason: err.Error()}
 	}
 
 	server.GroupKinds = gks
-	server.reused = reused
 	server.cleanup = cleanup
-	m.log.Debug("Diff server ready", "image", image, "address", server.Address, "reused", reused, "cleanup", cleanup)
+	m.log.Debug("Diff server ready", "image", image, "address", server.Address, "reused", running.Reused, "cleanup", cleanup)
 	return server, nil
 }
 
-// ensureContainer finds a live container with the deterministic name for this
-// package digest and reuses it, or starts a new one.
-func (m *Manager) ensureContainer(ctx context.Context, name, image string, publishAddr netip.Addr, labels map[string]string) (id string, reused bool, err error) {
-	id, found, running, err := m.rt.GetRunningContainerIDByName(ctx, name)
-	if err != nil {
-		return "", false, err
-	}
-	if found {
-		if !running {
-			if err := m.rt.StartContainerByID(ctx, id); err != nil {
-				return "", false, err
-			}
-		}
-		return id, true, nil
-	}
-
-	id, err = m.rt.StartContainer(ctx, name, image,
-		// --debug precedes the subcommand: it is the provider's global flag.
-		docker.StartWithCommand([]string{"--debug", "internal", "diff-server", "--address", fmt.Sprintf(":%d", containerPort)}),
-		docker.StartWithPublishedPort(publishAddr, containerPort),
-		docker.StartWithLabels(labels),
-	)
-	return id, false, err
-}
-
-func (m *Manager) connect(ctx context.Context, containerID, image, target string) (*Server, error) {
-	addr, err := m.rt.GetHostPort(ctx, containerID, containerPort)
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot determine diff server address")
-	}
-	if target != "" {
-		_, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, errors.Wrapf(err, "cannot parse diff server address %q", addr)
-		}
-		addr = net.JoinHostPort(target, port)
-	}
-
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+func (m *Manager) connect(ctx context.Context, running *containerruntime.Running, image string) (*Server, error) {
+	conn, err := grpc.NewClient(running.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot create gRPC client")
 	}
@@ -384,10 +331,11 @@ func (m *Manager) connect(ctx context.Context, containerID, image, target string
 
 	return &Server{
 		Image:       image,
-		Address:     addr,
-		ContainerID: containerID,
+		Address:     running.Addr,
+		ContainerID: running.ID,
 		conn:        conn,
 		client:      client,
+		running:     running,
 	}, nil
 }
 
@@ -450,10 +398,7 @@ func (m *Manager) Stop(ctx context.Context) error {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
-		if s.cleanup == CleanupOrphan {
-			continue
-		}
-		if err := m.rt.StopContainerByID(ctx, s.ContainerID); err != nil {
+		if err := s.running.Stop(ctx, s.cleanup); err != nil {
 			errs = append(errs, errors.Wrapf(err, "cannot stop diff server container %s", s.ContainerID))
 		}
 	}
@@ -466,31 +411,4 @@ func containerName(digest string) string {
 		d = d[:12]
 	}
 	return containerPrefix + d
-}
-
-// dockerRuntime implements containerRuntime with the real Docker daemon.
-type dockerRuntime struct{}
-
-func (dockerRuntime) StartContainer(ctx context.Context, name, image string, opts ...docker.StartContainerOption) (string, error) {
-	return docker.StartContainer(ctx, name, image, opts...)
-}
-
-func (dockerRuntime) StartContainerByID(ctx context.Context, id string) error {
-	return docker.StartContainerByID(ctx, id)
-}
-
-func (dockerRuntime) StopContainerByID(ctx context.Context, id string) error {
-	return docker.StopContainerByID(ctx, id)
-}
-
-func (dockerRuntime) GetRunningContainerIDByName(ctx context.Context, name string) (string, bool, bool, error) {
-	c, found, err := docker.GetContainerByName(ctx, name, true)
-	if err != nil || !found {
-		return "", false, false, err
-	}
-	return c.ID, true, strings.EqualFold(string(c.State), "running"), nil
-}
-
-func (dockerRuntime) GetHostPort(ctx context.Context, id string, port int) (string, error) {
-	return docker.GetHostPort(ctx, id, port)
 }
