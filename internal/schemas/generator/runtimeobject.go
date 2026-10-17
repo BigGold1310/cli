@@ -79,12 +79,7 @@ func fixListItemsFields(code string) (string, error) {
 		return "", errors.Wrap(err, "failed to parse Go code for Items field fix")
 	}
 
-	type edit struct {
-		start, end int
-		newText    string
-	}
-	var edits []edit
-
+	var edits []textEdit
 	for _, decl := range f.Decls {
 		gen, ok := decl.(*ast.GenDecl)
 		if !ok || gen.Tok != token.TYPE {
@@ -96,30 +91,10 @@ func fixListItemsFields(code string) (string, error) {
 				continue
 			}
 			st, ok := ts.Type.(*ast.StructType)
-			if !ok || st.Fields == nil {
+			if !ok || st.Fields == nil || metadataKind(st) != "ListMeta" {
 				continue
 			}
-			if metadataKind(st) != "ListMeta" {
-				continue
-			}
-			for _, field := range st.Fields.List {
-				if !hasFieldName(field, "Items") {
-					continue
-				}
-				star, ok := field.Type.(*ast.StarExpr)
-				if !ok {
-					continue
-				}
-				arr, ok := star.X.(*ast.ArrayType)
-				if !ok {
-					continue
-				}
-				edits = append(edits, edit{
-					start:   fset.Position(field.Type.Pos()).Offset,
-					end:     fset.Position(field.Type.End()).Offset,
-					newText: "[]" + renderType(fset, arr.Elt),
-				})
-			}
+			edits = append(edits, listItemsFieldEdits(fset, st)...)
 		}
 	}
 
@@ -130,6 +105,38 @@ func fixListItemsFields(code string) (string, error) {
 		code = code[:e.start] + e.newText + code[e.end:]
 	}
 	return code, nil
+}
+
+// textEdit replaces code[start:end] with newText.
+type textEdit struct {
+	start, end int
+	newText    string
+}
+
+// listItemsFieldEdits returns the edits that rewrite a List struct's Items
+// field from *[]Kind to []Kind. It returns nothing if Items is absent or isn't
+// a pointer-to-slice.
+func listItemsFieldEdits(fset *token.FileSet, st *ast.StructType) []textEdit {
+	var edits []textEdit
+	for _, field := range st.Fields.List {
+		if !hasFieldName(field, "Items") {
+			continue
+		}
+		star, ok := field.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		arr, ok := star.X.(*ast.ArrayType)
+		if !ok {
+			continue
+		}
+		edits = append(edits, textEdit{
+			start:   fset.Position(field.Type.Pos()).Offset,
+			end:     fset.Position(field.Type.End()).Offset,
+			newText: "[]" + renderType(fset, arr.Elt),
+		})
+	}
+	return edits
 }
 
 // addRuntimeObjects generates controller-gen-style DeepCopy methods for every
@@ -565,31 +572,30 @@ type objectMetaField struct {
 	zero   string
 }
 
-// objectMetaFields is every getter/setter pair sigs.k8s.io/apimachinery's
-// metav1.Object interface declares, in its exact declared types. This table
-// drives writeObjectMetaAccessors below.
-var objectMetaFields = []objectMetaField{ //nolint:gochecknoglobals // Lookup table.
-	{"Namespace", "string", `""`},
-	{"Name", "string", `""`},
-	{"GenerateName", "string", `""`},
-	{"UID", "k8stypes.UID", `""`},
-	{"ResourceVersion", "string", `""`},
-	{"Generation", "int64", "0"},
-	{"SelfLink", "string", `""`},
-	{"CreationTimestamp", "k8smetav1.Time", "k8smetav1.Time{}"},
-	{"DeletionTimestamp", "*k8smetav1.Time", "nil"},
-	{"DeletionGracePeriodSeconds", "*int64", "nil"},
-	{"Labels", "map[string]string", "nil"},
-	{"Annotations", "map[string]string", "nil"},
-	{"Finalizers", "[]string", "nil"},
-	{"OwnerReferences", "[]k8smetav1.OwnerReference", "nil"},
-	{"ManagedFields", "[]k8smetav1.ManagedFieldsEntry", "nil"},
-}
-
 // writeObjectMetaAccessors appends the metav1.Object getter/setter pairs for
 // name, delegating to its Metadata field. Getters return the zero value when
 // Metadata is nil; setters allocate it lazily.
 func writeObjectMetaAccessors(b *strings.Builder, name string) {
+	// objectMetaFields is every getter/setter pair sigs.k8s.io/apimachinery's
+	// metav1.Object interface declares, in its exact declared types.
+	objectMetaFields := []objectMetaField{
+		{"Namespace", "string", `""`}, //nolint:goconst // Literal type names read better than constants in generated code.
+		{"Name", "string", `""`},
+		{"GenerateName", "string", `""`},
+		{"UID", "k8stypes.UID", `""`},
+		{"ResourceVersion", "string", `""`},
+		{"Generation", "int64", "0"},
+		{"SelfLink", "string", `""`},
+		{"CreationTimestamp", "k8smetav1.Time", "k8smetav1.Time{}"},
+		{"DeletionTimestamp", "*k8smetav1.Time", "nil"}, //nolint:goconst // Literal zero values read better than constants in generated code.
+		{"DeletionGracePeriodSeconds", "*int64", "nil"},
+		{"Labels", "map[string]string", "nil"},
+		{"Annotations", "map[string]string", "nil"},
+		{"Finalizers", "[]string", "nil"},
+		{"OwnerReferences", "[]k8smetav1.OwnerReference", "nil"},
+		{"ManagedFields", "[]k8smetav1.ManagedFieldsEntry", "nil"},
+	}
+
 	for _, f := range objectMetaFields {
 		fmt.Fprintf(b, "\nfunc (in *%s) Get%s() %s {\n", name, f.name, f.goType)
 		b.WriteString("\tif in.Metadata == nil {\n")
@@ -612,17 +618,17 @@ type listMetaField struct {
 	zero   string
 }
 
-// listMetaFields is every getter/setter pair metav1.ListInterface declares.
-var listMetaFields = []listMetaField{ //nolint:gochecknoglobals // Lookup table.
-	{"ResourceVersion", "string", `""`},
-	{"SelfLink", "string", `""`},
-	{"Continue", "string", `""`},
-	{"RemainingItemCount", "*int64", "nil"},
-}
-
 // writeListInterfaceAccessors is writeObjectMetaAccessors' counterpart for
 // metav1.ListInterface.
 func writeListInterfaceAccessors(b *strings.Builder, name string) {
+	// listMetaFields is every getter/setter pair metav1.ListInterface declares.
+	listMetaFields := []listMetaField{
+		{"ResourceVersion", "string", `""`},
+		{"SelfLink", "string", `""`},
+		{"Continue", "string", `""`},
+		{"RemainingItemCount", "*int64", "nil"},
+	}
+
 	for _, f := range listMetaFields {
 		fmt.Fprintf(b, "\nfunc (in *%s) Get%s() %s {\n", name, f.name, f.goType)
 		b.WriteString("\tif in.Metadata == nil {\n")
