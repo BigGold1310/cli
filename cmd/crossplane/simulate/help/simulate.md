@@ -16,29 +16,29 @@ by default: the CLI follows each resource's kind to the provider that
 installed it on the cluster, so the preview matches the provider versions
 actually serving those resources. --providers overrides that discovery with
 a file of Provider manifests (like render takes Function manifests), for
-example to preview how a provider version that is not installed yet would
+example to preview how a provider version that isn't installed yet would
 treat existing resources. The manifests also carry per-provider runtime
 annotations (`simulate.crossplane.io/runtime-docker-publish-address` and
 `simulate.crossplane.io/runtime-docker-target`) for Docker setups where the
-published port is not reachable on the address the daemon reports.
+published port isn't reachable on the address the daemon reports.
 
 Not every provider serves diffs. A provider package declares the capability
 in its metadata, and a resource whose provider serves no diff server (or
-whose diff server cannot compute a diff for it) still appears in the preview
+whose diff server can't compute a diff for it) still appears in the preview
 with an approximate client-side comparison, marked [?], rather than failing
-the run or silently dropping out.
+the run or dropping out of the preview.
 
 Nothing simulate does writes to the cluster or the cloud: it reads the
 cluster with your kubeconfig and RBAC, and the diff servers run locally with
 no credentials and no cluster access.
 
-Diff server startup takes a few seconds per provider image. In an
+Diff server startup takes seconds per provider image. In an
 edit-simulate-edit loop, annotate a provider manifest with
 `simulate.crossplane.io/runtime-docker-cleanup: Orphan` (like render's
 per-function cleanup annotation) to leave its container running so the next
-run reuses it; containers are named `crossplane-diff-server-DIGEST`, carry
-`simulate.crossplane.io/managed-by` and session labels, and are cleaned up by
-any later run without the annotation, or manually with docker rm.
+run reuses it. The containers have names like `crossplane-diff-server-DIGEST`
+and carry `simulate.crossplane.io/managed-by` and session labels; any later
+run without the annotation cleans them up, or remove them with docker rm.
 
 ## Examples
 
@@ -55,7 +55,7 @@ from a checked-in file of Provider manifests:
 crossplane resource simulate -f resources.yaml --providers providers.yaml
 ```
 
-Keep diff servers running for faster subsequent runs, via a provider manifest
+Keep diff servers running so later runs start faster, via a provider manifest
 annotated with `simulate.crossplane.io/runtime-docker-cleanup: Orphan`:
 
 ```shell

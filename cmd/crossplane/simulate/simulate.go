@@ -31,6 +31,7 @@ import (
 	"github.com/alecthomas/kong"
 	diffv1alpha1 "github.com/crossplane/upjet/v2/proto/diff/v1alpha1"
 	"github.com/spf13/afero"
+	"google.golang.org/protobuf/types/known/structpb"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -85,11 +86,11 @@ const (
 
 // Cmd previews what applying managed resources would do.
 type Cmd struct {
-	Filename string `help:"YAML file(s) or directory with managed resources, or '-' for stdin (comma-separated)." predictor:"yaml_file_or_directory" required:"" short:"f"`
+	Filename string `help:"YAML files or directory with managed resources, or '-' for stdin (comma-separated)." predictor:"yaml_file_or_directory" required:"" short:"f"`
 
 	Providers    string        `help:"YAML file or directory with Provider manifests to run as diff servers, overriding discovery from the cluster. Supports per-provider runtime annotations."       name:"providers"                                                    optional:""                                     predictor:"yaml_file_or_directory" type:"path"`
 	ImageConfigs string        `help:"YAML file with ImageConfig manifests that rewrite provider image paths for local pulls. Defaults to the project's imageConfigs when a project file is present." name:"image-configs"                                                optional:""                                     predictor:"yaml_file"              type:"existingfile"`
-	ProjectFile  string        `default:"${project_file}"                                                                                                                                             help:"Path to a project definition file to read imageConfigs from." name:"project-file"`
+	ProjectFile  string        `help:"Path to a project definition file to read imageConfigs from. Defaults to ${project_file} when present."                                                          name:"project-file"                                                 optional:""`
 	SessionID    string        `help:"Session ID to apply as the simulate.crossplane.io/session label on diff server containers. Defaults to a random per-process ID."                                placeholder:"ID"`
 	Context      string        `default:""                                                                                                                                                            help:"Kubernetes context."                                          name:"context"                                  predictor:"context"                short:"c"`
 	CacheDir     string        `default:"~/.crossplane/cache"                                                                                                                                         help:"Cache directory for downloaded provider packages."            name:"cache-dir"                                predictor:"directory"`
@@ -130,6 +131,11 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 	}
 	if len(resources) == 0 {
 		return errors.Errorf("no resources found in %q", c.Filename)
+	}
+
+	renderer, err := plan.NewRenderer(c.Output)
+	if err != nil {
+		return err
 	}
 
 	if err := docker.Check(ctx); err != nil {
@@ -194,34 +200,43 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 	}
 
 	plans := make([]*plan.ResourcePlan, 0, len(resources))
+	stores := newObjectStoreCache()
 	for _, desired := range resources {
-		plans = append(plans, c.simulateOne(ctx, kubeClient, rmapper, defaultNamespace, mgr, desired))
+		plans = append(plans, c.simulateOne(ctx, kubeClient, rmapper, defaultNamespace, mgr, stores, desired))
 	}
 
-	return plan.Render(k.Stdout, c.Output, plans)
+	return renderer.Render(k.Stdout, plans)
 }
 
 // imageConfigs returns the ImageConfigs to rewrite provider image paths with:
 // the --image-configs file when given, else the imageConfigs of the project
 // the command happens to run in, if any. Running outside a project is the
-// norm for this command, so a missing project file is not an error.
+// norm for this command, so a missing project file is only an error when the
+// user asked for one explicitly with --project-file.
 func (c *Cmd) imageConfigs() ([]pkgv1beta1.ImageConfig, error) {
 	if c.ImageConfigs != "" {
 		ics, err := loadImageConfigs(c.ImageConfigs)
 		return ics, errors.Wrapf(err, "cannot load image configs from %q", c.ImageConfigs)
 	}
 
-	projFilePath, err := filepath.Abs(c.ProjectFile)
+	name, explicit := c.ProjectFile, true
+	if name == "" {
+		name, explicit = clixpkg.ProjectFile, false
+	}
+	projFilePath, err := filepath.Abs(name)
 	if err != nil {
-		return nil, nil //nolint:nilerr // Best effort: no resolvable project file means no project image configs.
+		return nil, errors.Wrapf(err, "cannot determine path for %q", name)
 	}
 	if _, err := os.Stat(projFilePath); err != nil {
+		if explicit {
+			return nil, errors.Wrapf(err, "cannot read project file %q", name)
+		}
 		return nil, nil //nolint:nilerr // Best effort: no project file means no project image configs.
 	}
 	projFS := afero.NewBasePathFs(afero.NewOsFs(), filepath.Dir(projFilePath))
 	proj, err := projectfile.Parse(projFS, filepath.Base(projFilePath))
 	if err != nil {
-		return nil, errors.Wrapf(err, "cannot parse project file %q", c.ProjectFile)
+		return nil, errors.Wrapf(err, "cannot parse project file %q", name)
 	}
 	return proj.Spec.ImageConfigs, nil
 }
@@ -303,7 +318,7 @@ type router interface {
 // to a diff server, and fall back to the approximate client-side diff when no
 // server can plan it. Failures become per-resource errors so one resource
 // never fails the whole run.
-func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, mgr router, desired *unstructured.Unstructured) *plan.ResourcePlan {
+func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, mgr router, stores *objectStoreCache, desired *unstructured.Unstructured) *plan.ResourcePlan {
 	if desired.GetName() == "" {
 		p := plan.NewResourcePlan(desired)
 		p.Error = "resource has no name"
@@ -331,7 +346,7 @@ func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper
 	pctx, cancel := context.WithTimeout(ctx, c.Timeout)
 	defer cancel()
 
-	store := objectStore(ctx, kubeClient, rmapper, defaultNamespace, desired, live)
+	store := stores.gather(ctx, kubeClient, rmapper, defaultNamespace, desired, live)
 
 	p, err := plan.Plan(pctx, planClient, desired, live, store)
 	if err != nil {
@@ -377,7 +392,25 @@ func fetchLive(ctx context.Context, kubeClient client.Client, rmapper meta.RESTM
 	return live, nil
 }
 
-// objectStore gathers the cluster objects the diff server needs to resolve
+// objectStoreCache caches gathered object stores by the resolved
+// ProviderConfig identity, so a run over many resources referencing the same
+// ProviderConfig fetches and converts it once rather than per resource.
+// Missing objects are cached too: a reference the cluster cannot resolve is
+// not refetched for every resource that carries it.
+type objectStoreCache struct {
+	cache map[objectStoreKey][]*structpb.Struct
+}
+
+type objectStoreKey struct {
+	gvk schema.GroupVersionKind
+	key client.ObjectKey
+}
+
+func newObjectStoreCache() *objectStoreCache {
+	return &objectStoreCache{cache: map[objectStoreKey][]*structpb.Struct{}}
+}
+
+// gather returns the cluster objects the diff server needs to resolve
 // the desired resource: today the ProviderConfig it references. The diff
 // server is offline and only sees what travels in the request, so anything it
 // must resolve is fetched here, with the user's own kubeconfig and RBAC. The
@@ -385,7 +418,7 @@ func fetchLive(ctx context.Context, kubeClient client.Client, rmapper meta.RESTM
 // offline with placeholder credentials and never needs the real ones.
 // Gathering is best effort: a missing object simply stays out of the store,
 // and the server reports precisely what it could not resolve.
-func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, desired, live *unstructured.Unstructured) []*unstructured.Unstructured {
+func (c *objectStoreCache) gather(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, desired, live *unstructured.Unstructured) []*structpb.Struct {
 	// Read the reference from the live resource when one exists: the API
 	// server has already applied the CRD's defaults there, so its kind and
 	// name are authoritative. The desired manifest may omit both.
@@ -409,20 +442,26 @@ func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RES
 		}
 	}
 
+	// The ProviderConfig's group relates to the resource's group, but not
+	// uniformly: most providers serve it one level up (s3.aws.upbound.io →
+	// aws.upbound.io), others in the resource's own group
+	// (kubernetes.crossplane.io). Probe from the resource's group toward the
+	// root and take the first group that serves the kind.
 	group := desired.GroupVersionKind().Group
-	i := strings.Index(group, ".")
-	if i < 0 {
-		return nil
+	var mapping *meta.RESTMapping
+	for {
+		m, err := rmapper.RESTMapping(schema.GroupKind{Group: group, Kind: kind})
+		if err == nil {
+			mapping = m
+			break
+		}
+		i := strings.Index(group, ".")
+		if i < 0 {
+			return nil
+		}
+		group = group[i+1:]
 	}
-	group = group[i+1:]
 
-	mapping, err := rmapper.RESTMapping(schema.GroupKind{Group: group, Kind: kind})
-	if err != nil {
-		return nil
-	}
-
-	pc := &unstructured.Unstructured{}
-	pc.SetGroupVersionKind(mapping.GroupVersionKind)
 	key := client.ObjectKey{Name: name}
 	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
 		key.Namespace = desired.GetNamespace()
@@ -430,19 +469,31 @@ func objectStore(ctx context.Context, kubeClient client.Client, rmapper meta.RES
 			key.Namespace = defaultNamespace
 		}
 	}
-	if err := kubeClient.Get(ctx, key, pc); err != nil {
-		return nil
+
+	ck := objectStoreKey{gvk: mapping.GroupVersionKind, key: key}
+	if store, ok := c.cache[ck]; ok {
+		return store
 	}
-	return []*unstructured.Unstructured{pc}
+
+	var store []*structpb.Struct
+	pc := &unstructured.Unstructured{}
+	pc.SetGroupVersionKind(mapping.GroupVersionKind)
+	if err := kubeClient.Get(ctx, key, pc); err == nil {
+		if s, err := structpb.NewStruct(pc.Object); err == nil {
+			store = []*structpb.Struct{s}
+		}
+	}
+	c.cache[ck] = store
+	return store
 }
 
 // relevantProviderImages returns the package images of exactly the providers
 // that serve the given resources, so simulate never starts a diff server it
 // will not route to. Discovery follows the ownership chain on the cluster:
-// each resource's kind maps to a CRD, the CRD is owned by the
-// ProviderRevision that installed it, and the revision carries the resolved
-// package image. Kinds that resolve to no provider are skipped; their
-// resources degrade to the approximate client-side diff.
+// each resource's kind maps to a CRD, the CRD is controlled by the active
+// ProviderRevision, and the revision carries the resolved package image.
+// Kinds that resolve to no provider are skipped; their resources degrade to
+// the approximate client-side diff.
 func relevantProviderImages(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, resources []*unstructured.Unstructured, preferOriginal bool) ([]string, error) {
 	seenGK := map[schema.GroupKind]bool{}
 	seenImage := map[string]bool{}
@@ -471,9 +522,12 @@ func relevantProviderImages(ctx context.Context, kubeClient client.Client, rmapp
 			return nil, errors.Wrapf(err, "cannot get CRD %s", crdName)
 		}
 
+		// After an upgrade every revision of the provider still owns the CRD;
+		// only the active revision holds the controller reference, and that is
+		// the one serving the resources.
 		revision := ""
 		for _, ref := range crd.GetOwnerReferences() {
-			if ref.Kind == "ProviderRevision" && strings.HasPrefix(ref.APIVersion, "pkg.crossplane.io/") {
+			if ref.Kind == "ProviderRevision" && strings.HasPrefix(ref.APIVersion, "pkg.crossplane.io/") && ref.Controller != nil && *ref.Controller {
 				revision = ref.Name
 				break
 			}

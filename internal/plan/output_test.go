@@ -102,7 +102,11 @@ Warning: 1 resource could not be planned.
 `
 
 	var buf bytes.Buffer
-	if err := Render(&buf, FormatPlan, testPlans()); err != nil {
+	r, err := NewRenderer(FormatPlan)
+	if err != nil {
+		t.Fatalf("NewRenderer(plan): unexpected error: %v", err)
+	}
+	if err := r.Render(&buf, testPlans()); err != nil {
 		t.Fatalf("Render(plan): unexpected error: %v", err)
 	}
 	if diff := cmp.Diff(want, buf.String()); diff != "" {
@@ -110,16 +114,19 @@ Warning: 1 resource could not be planned.
 	}
 }
 
-func TestRenderUnknownFormat(t *testing.T) {
-	var buf bytes.Buffer
-	if err := Render(&buf, "diff", testPlans()); err == nil {
-		t.Errorf("Render(diff): want an error for an unsupported format")
+func TestNewRendererUnknownFormat(t *testing.T) {
+	if _, err := NewRenderer("diff"); err == nil {
+		t.Errorf("NewRenderer(diff): want an error for an unsupported format")
 	}
 }
 
 func TestRenderJSON(t *testing.T) {
 	var buf bytes.Buffer
-	if err := Render(&buf, FormatJSON, testPlans()); err != nil {
+	r, err := NewRenderer(FormatJSON)
+	if err != nil {
+		t.Fatalf("NewRenderer(json): unexpected error: %v", err)
+	}
+	if err := r.Render(&buf, testPlans()); err != nil {
 		t.Fatalf("Render(json): unexpected error: %v", err)
 	}
 

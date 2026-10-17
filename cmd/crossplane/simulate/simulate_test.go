@@ -34,7 +34,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/crossplane/crossplane/apis/v2/pkg"
 	pkgv1 "github.com/crossplane/crossplane/apis/v2/pkg/v1"
@@ -156,7 +158,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
 		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if got.Action != plan.ActionUpdate || got.Approximate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a provider-computed update, got %+v", got)
@@ -170,7 +172,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).Build()
 		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, vpc("new-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("new-vpc", "10.0.0.0/16"))
 
 		if got.Action != plan.ActionCreate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a create, got %+v", got)
@@ -184,7 +186,7 @@ func TestSimulateOne(t *testing.T) {
 		live := vpc("my-vpc", "10.0.0.0/16")
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if !got.Approximate || got.Action != plan.ActionUpdate {
 			t.Errorf("simulateOne(...): want an approximate update fallback, got %+v", got)
@@ -196,7 +198,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
 		pc := &fakePlanClient{err: notSupportedErr(t)}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if !got.Approximate || got.Action != plan.ActionUpdate {
 			t.Errorf("simulateOne(...): want an approximate fallback on DIFF_COMPUTATION_NOT_SUPPORTED, got %+v", got)
@@ -207,7 +209,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).Build()
 		pc := &fakePlanClient{err: status.Error(codes.Internal, "boom")}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if got.Error == "" {
 			t.Errorf("simulateOne(...): want a per-resource error, got %+v", got)
@@ -248,7 +250,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(seedScheme).WithObjects(pc, secret).Build()
 		pc2 := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, seedRM, "default", &fakeRouter{client: pc2}, vpc("my-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, seedRM, "default", &fakeRouter{client: pc2}, newObjectStoreCache(), vpc("my-vpc", "10.0.0.0/16"))
 
 		if got.Error != "" {
 			t.Fatalf("simulateOne(...): unexpected error: %s", got.Error)
@@ -258,6 +260,57 @@ func TestSimulateOne(t *testing.T) {
 		}
 		if k := pc2.got.GetKubernetesObjectStore()[0].GetFields()["kind"].GetStringValue(); k != "ProviderConfig" {
 			t.Errorf("simulateOne(...): want a ProviderConfig in the object store, got %q", k)
+		}
+	})
+
+	t.Run("FindsProviderConfigInResourceGroup", func(t *testing.T) {
+		// provider-kubernetes serves its ProviderConfig in the same group as
+		// its resources, not one level up like upjet-based providers.
+		objGVK := schema.GroupVersionKind{Group: "kubernetes.crossplane.io", Version: "v1alpha2", Kind: "Object"}
+		pcGVK := schema.GroupVersionKind{Group: "kubernetes.crossplane.io", Version: "v1alpha1", Kind: "ProviderConfig"}
+
+		scheme := runtime.NewScheme()
+		scheme.AddKnownTypeWithName(objGVK, &unstructured.Unstructured{})
+		scheme.AddKnownTypeWithName(objGVK.GroupVersion().WithKind("ObjectList"), &unstructured.UnstructuredList{})
+		scheme.AddKnownTypeWithName(pcGVK, &unstructured.Unstructured{})
+		scheme.AddKnownTypeWithName(pcGVK.GroupVersion().WithKind("ProviderConfigList"), &unstructured.UnstructuredList{})
+
+		mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{objGVK.GroupVersion(), pcGVK.GroupVersion()})
+		mapper.Add(objGVK, meta.RESTScopeRoot)
+		mapper.Add(pcGVK, meta.RESTScopeRoot)
+
+		pc := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "kubernetes.crossplane.io/v1alpha1",
+			"kind":       "ProviderConfig",
+			"metadata":   map[string]any{"name": "default"},
+		}}
+		desired := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "kubernetes.crossplane.io/v1alpha2",
+			"kind":       "Object",
+			"metadata":   map[string]any{"name": "my-object"},
+		}}
+
+		gets := 0
+		kube := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pc).
+			WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				gets++
+				return c.Get(ctx, key, obj, opts...)
+			}}).Build()
+
+		stores := newObjectStoreCache()
+		got := stores.gather(ctx, kube, mapper, "default", desired, nil)
+
+		if len(got) != 1 || got[0].GetFields()["kind"].GetStringValue() != "ProviderConfig" {
+			t.Errorf("gather(...): want the same-group ProviderConfig, got %v", got)
+		}
+
+		// A second resource referencing the same ProviderConfig is served from
+		// the cache without another fetch.
+		if again := stores.gather(ctx, kube, mapper, "default", desired, nil); len(again) != 1 {
+			t.Errorf("gather(...): want the cached ProviderConfig, got %v", again)
+		}
+		if gets != 1 {
+			t.Errorf("gather(...): want 1 fetch for 2 gathers of the same ProviderConfig, got %d", gets)
 		}
 	})
 
@@ -271,17 +324,29 @@ func TestSimulateOne(t *testing.T) {
 			t.Fatalf("cannot add pkg scheme: %v", err)
 		}
 
+		// After an upgrade the inactive old revision still owns the CRD; only
+		// the active revision is its controller, and discovery must follow
+		// the controller reference.
 		crd := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "apiextensions.k8s.io/v1",
 			"kind":       "CustomResourceDefinition",
 			"metadata": map[string]any{
 				"name": "vpcs.ec2.aws.upbound.io",
-				"ownerReferences": []any{map[string]any{
-					"apiVersion": "pkg.crossplane.io/v1",
-					"kind":       "ProviderRevision",
-					"name":       "provider-aws-ec2-abc123",
-					"uid":        "00000000-0000-0000-0000-000000000000",
-				}},
+				"ownerReferences": []any{
+					map[string]any{
+						"apiVersion": "pkg.crossplane.io/v1",
+						"kind":       "ProviderRevision",
+						"name":       "provider-aws-ec2-old999",
+						"uid":        "00000000-0000-0000-0000-000000000001",
+					},
+					map[string]any{
+						"apiVersion": "pkg.crossplane.io/v1",
+						"kind":       "ProviderRevision",
+						"name":       "provider-aws-ec2-abc123",
+						"uid":        "00000000-0000-0000-0000-000000000000",
+						"controller": true,
+					},
+				},
 			},
 		}}
 		prv := &pkgv1.ProviderRevision{}
@@ -313,7 +378,7 @@ func TestSimulateOne(t *testing.T) {
 		emptyRM := meta.NewDefaultRESTMapper(nil)
 		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, emptyRM, "default", &fakeRouter{client: pc}, vpc("my-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, emptyRM, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.0.0.0/16"))
 
 		if got.Action != plan.ActionCreate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a create for an unserved kind, got %+v", got)

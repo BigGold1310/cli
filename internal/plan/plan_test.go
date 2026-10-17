@@ -24,7 +24,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // fakePlanClient implements diffv1alpha1.PlanServiceClient in-process,
@@ -43,16 +43,19 @@ func (f *fakePlanClient) Plan(_ context.Context, in *diffv1alpha1.PlanRequest, _
 func TestPlan(t *testing.T) {
 	desired := mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.1.0.0/16"}})
 	actual := mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}})
-	secret := &unstructured.Unstructured{Object: map[string]any{
+	secret, err := structpb.NewStruct(map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Secret",
 		"metadata":   map[string]any{"name": "creds", "namespace": "default"},
-	}}
+	})
+	if err != nil {
+		t.Fatalf("cannot convert secret: %v", err)
+	}
 
 	t.Run("RequestCarriesAllState", func(t *testing.T) {
 		c := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}}
 
-		got, err := Plan(context.Background(), c, desired, actual, []*unstructured.Unstructured{secret})
+		got, err := Plan(context.Background(), c, desired, actual, []*structpb.Struct{secret})
 		if err != nil {
 			t.Fatalf("Plan(...): unexpected error: %v", err)
 		}

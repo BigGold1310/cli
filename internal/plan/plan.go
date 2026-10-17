@@ -31,13 +31,14 @@ import (
 // status.atProvider and external-name annotation; nil means the resource does
 // not exist yet and plans as a create. store seeds the server's in-memory
 // Kubernetes client with objects (Secrets, referenced resources) it may need
-// to resolve the desired state.
+// to resolve the desired state; it is already in proto form so callers can
+// convert a shared object once across many Plan calls.
 //
 // gRPC errors are returned as-is so callers can branch on them; use
 // IsNotSupported to detect the "this resource cannot be planned" case that
 // should fall back to an approximate client-side diff.
-func Plan(ctx context.Context, c diffv1alpha1.PlanServiceClient, desired, actual *unstructured.Unstructured, store []*unstructured.Unstructured) (*ResourcePlan, error) {
-	req := &diffv1alpha1.PlanRequest{}
+func Plan(ctx context.Context, c diffv1alpha1.PlanServiceClient, desired, actual *unstructured.Unstructured, store []*structpb.Struct) (*ResourcePlan, error) {
+	req := &diffv1alpha1.PlanRequest{KubernetesObjectStore: store}
 
 	var err error
 	if req.DesiredResource, err = structpb.NewStruct(desired.Object); err != nil {
@@ -47,13 +48,6 @@ func Plan(ctx context.Context, c diffv1alpha1.PlanServiceClient, desired, actual
 		if req.ActualResource, err = structpb.NewStruct(actual.Object); err != nil {
 			return nil, errors.Wrap(err, "cannot convert actual resource")
 		}
-	}
-	for _, o := range store {
-		s, err := structpb.NewStruct(o.Object)
-		if err != nil {
-			return nil, errors.Wrapf(err, "cannot convert object store entry %s/%s", o.GetNamespace(), o.GetName())
-		}
-		req.KubernetesObjectStore = append(req.KubernetesObjectStore, s)
 	}
 
 	rsp, err := c.Plan(ctx, req)

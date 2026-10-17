@@ -105,30 +105,56 @@ func NewResult(plans []*ResourcePlan) Result {
 	}
 }
 
-// Render writes the plans to w in the given format.
-func Render(w io.Writer, format string, plans []*ResourcePlan) error {
-	switch format {
-	case FormatPlan:
-		return renderPlan(w, plans)
-	case FormatJSON:
-		out, err := json.MarshalIndent(NewResult(plans), "", "  ")
-		if err != nil {
-			return errors.Wrap(err, "cannot marshal plans to JSON")
-		}
-		_, err = fmt.Fprintln(w, string(out))
-		return err
-	case FormatYAML:
-		out, err := yaml.Marshal(NewResult(plans))
-		if err != nil {
-			return errors.Wrap(err, "cannot marshal plans to YAML")
-		}
-		_, err = fmt.Fprint(w, string(out))
-		return err
-	}
-	return errors.Errorf("unknown output format %q", format)
+// A Renderer writes resource plans to w in one output format.
+type Renderer interface {
+	Render(w io.Writer, plans []*ResourcePlan) error
 }
 
-func renderPlan(w io.Writer, plans []*ResourcePlan) error {
+// NewRenderer returns the Renderer for the given output format.
+func NewRenderer(format string) (Renderer, error) {
+	switch format {
+	case FormatPlan:
+		return PlanRenderer{}, nil
+	case FormatJSON:
+		return JSONRenderer{}, nil
+	case FormatYAML:
+		return YAMLRenderer{}, nil
+	}
+	return nil, errors.Errorf("unknown output format %q", format)
+}
+
+// JSONRenderer renders the serialized Result as indented JSON.
+type JSONRenderer struct{}
+
+// Render writes the plans to w as JSON.
+func (JSONRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
+	out, err := json.MarshalIndent(NewResult(plans), "", "  ")
+	if err != nil {
+		return errors.Wrap(err, "cannot marshal plans to JSON")
+	}
+	_, err = fmt.Fprintln(w, string(out))
+	return err
+}
+
+// YAMLRenderer renders the serialized Result as YAML.
+type YAMLRenderer struct{}
+
+// Render writes the plans to w as YAML.
+func (YAMLRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
+	out, err := yaml.Marshal(NewResult(plans))
+	if err != nil {
+		return errors.Wrap(err, "cannot marshal plans to YAML")
+	}
+	_, err = fmt.Fprint(w, string(out))
+	return err
+}
+
+// PlanRenderer renders the human-readable plan format: a header and change
+// tree per resource, then a summary with warnings.
+type PlanRenderer struct{}
+
+// Render writes the plans to w in the human-readable plan format.
+func (PlanRenderer) Render(w io.Writer, plans []*ResourcePlan) error {
 	for _, p := range plans {
 		_, _ = fmt.Fprintln(w, header(p))
 		if p.Error != "" {
