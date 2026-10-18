@@ -45,6 +45,11 @@ if [ "${NIX_SH_CONTAINER:-}" = "1" ]; then
 	# by the host user. Git refuses to operate in directories owned by other
 	# users.
 	git config --global --add safe.directory /crossplane-cli
+	# In a worktree, git also checks the ownership of the mounted git
+	# directories, whose paths vary. The container is ephemeral, so trust all.
+	if [ -n "${WORKTREE_GIT_DIRS:-}" ]; then
+		git config --global --add safe.directory '*'
+	fi
 
 	# Record the current time. After nix runs, we'll find files newer than this
 	# marker and chown them to the host user.
@@ -110,10 +115,25 @@ if [ -t 1 ]; then
 	INTERACTIVE_FLAGS="-it"
 fi
 
+# In a linked git worktree, .git is a file pointing at the main checkout's
+# .git directory, which isn't visible inside the container. Mount that
+# directory at its host path and overlay a .git file with an absolute gitdir
+# so git (and Nix's flake evaluation) can resolve the repository.
+WORKTREE_FLAGS=()
+if [ -f .git ]; then
+	git_dir=$(git rev-parse --absolute-git-dir)
+	git_common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+	git_file=$(mktemp)
+	trap 'rm -f "${git_file}"' EXIT
+	echo "gitdir: ${git_dir}" >"${git_file}"
+	WORKTREE_FLAGS=(-e "WORKTREE_GIT_DIRS=${git_dir} ${git_common_dir}" -v "$(pwd -P):$(pwd -P)" -v "${git_common_dir}:${git_common_dir}" -v "${git_file}:/crossplane-cli/.git:ro")
+fi
+
 # Run with --privileged for Docker-in-Docker (required for kind clusters).
 docker run --rm --privileged --cgroupns=host ${INTERACTIVE_FLAGS} \
 	-v "$(pwd):/crossplane-cli" \
 	-v "crossplane-cli-nix:/nix" \
+	${WORKTREE_FLAGS[@]+"${WORKTREE_FLAGS[@]}"} \
 	-w /crossplane-cli \
 	-e "NIX_SH_CONTAINER=1" \
 	-e "NIX_CONFIG=${NIX_CONFIG}" \
