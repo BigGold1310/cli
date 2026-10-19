@@ -953,10 +953,10 @@ func rustWriteStruct(sb *strings.Builder, t rustType) {
 	// apiVersion and kind, so no trait shared with an SDK has to stamp them.
 	sb.WriteString("\nimpl " + t.name + " {\n")
 	sb.WriteString("    /// The apiVersion of this resource.\n")
-	sb.WriteString("    pub const API_VERSION: &'static str = " + strconv.Quote(t.root.apiVersion) + ";\n")
+	sb.WriteString("    pub const API_VERSION: &str = " + strconv.Quote(t.root.apiVersion) + ";\n")
 	sb.WriteString("\n")
 	sb.WriteString("    /// The kind of this resource.\n")
-	sb.WriteString("    pub const KIND: &'static str = " + strconv.Quote(t.root.kind) + ";\n")
+	sb.WriteString("    pub const KIND: &str = " + strconv.Quote(t.root.kind) + ";\n")
 	sb.WriteString("}\n")
 
 	sb.WriteString("\nimpl Default for " + t.name + " {\n")

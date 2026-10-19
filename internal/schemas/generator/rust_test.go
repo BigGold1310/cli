@@ -164,10 +164,10 @@ pub struct Widget {
 
 impl Widget {
     /// The apiVersion of this resource.
-    pub const API_VERSION: &'static str = "example.com/v1";
+    pub const API_VERSION: &str = "example.com/v1";
 
     /// The kind of this resource.
-    pub const KIND: &'static str = "Widget";
+    pub const KIND: &str = "Widget";
 }
 
 impl Default for Widget {
@@ -621,8 +621,8 @@ func TestGenerateFromCRDRust(t *testing.T) {
 						// The XR is a resource, so it carries its own group,
 						// version and kind.
 						"pub struct XAccountScaffold {",
-						`pub const API_VERSION: &'static str = "platform.acme.co/v1alpha1";`,
-						`pub const KIND: &'static str = "XAccountScaffold";`,
+						`pub const API_VERSION: &str = "platform.acme.co/v1alpha1";`,
+						`pub const KIND: &str = "XAccountScaffold";`,
 						"impl Default for XAccountScaffold {",
 						"api_version: Some(Self::API_VERSION.to_string()),",
 						"kind: Some(Self::KIND.to_string()),",
@@ -781,8 +781,8 @@ func TestGenerateFromOpenAPIRust(t *testing.T) {
 						// Schemas served by an API server declare their GVK in
 						// an extension, which goAddDefaults turns into the
 						// defaults we key on.
-						`pub const API_VERSION: &'static str = "v1";`,
-						`pub const KIND: &'static str = "Pod";`,
+						`pub const API_VERSION: &str = "v1";`,
+						`pub const KIND: &str = "Pod";`,
 						"pub metadata: Option<crate::io::k8s::apimachinery::pkg::apis::meta::v1::ObjectMeta>,",
 						"pub spec: Option<crate::io::k8s::api::core::v1::PodSpec>,",
 						// Kubernetes documents declare a kind's helpers as
