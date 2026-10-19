@@ -8,6 +8,10 @@
 #
 # The first run downloads dependencies into /nix/store (cached in a Docker
 # volume). Subsequent runs reuse the cache. To reset: docker volume rm crossplane-cli-nix
+#
+# Runs can be concurrent (e.g. from different git worktrees). They share the Nix
+# store but each uses its own Docker data root, so kind node images are cached
+# per slot (/nix/docker, /nix/docker-1, ...) and may be pulled again in slot 1+.
 
 set -e
 
@@ -16,19 +20,36 @@ set -e
 
 if [ "${NIX_SH_CONTAINER:-}" = "1" ]; then
 	# Install tools this entrypoint script needs. It needs Docker to setup
-	# Docker in Docker for E2E tests, and rsync to copy build the build result
-	# (cp doesn't work well on MacOS volumes). Installed packages persist across
-	# runs thanks to the crossplane-cli-nix volume.
-	if ! command -v docker &>/dev/null || ! command -v rsync &>/dev/null; then
-		nix-env -iA nixpkgs.docker nixpkgs.rsync
+	# Docker in Docker for E2E tests, rsync to copy build the build result
+	# (cp doesn't work well on MacOS volumes), and flock to claim a Docker data
+	# root below. Installed packages persist across runs thanks to the
+	# crossplane-cli-nix volume.
+	if ! command -v docker &>/dev/null || ! command -v rsync &>/dev/null || ! command -v flock &>/dev/null; then
+		nix-env -iA nixpkgs.docker nixpkgs.rsync nixpkgs.util-linux
 	fi
 
 	# Start the Docker daemon, storing its data in the crossplane-cli-nix volume
 	# for persistence across container runs. This gives us a consistent Docker
-	# environment with cached images (e.g., kind node images). Run it from / so
-	# its children don't use the bind-mounted checkout as their working
-	# directory; a crashing child would otherwise leave a core file there.
-	(cd / && exec dockerd --data-root=/nix/docker >/tmp/dockerd.log 2>&1) &
+	# environment with cached images (e.g., kind node images). A Docker data
+	# root can only be used by one daemon at a time, so concurrent runs (e.g.
+	# from different worktrees) each claim the first free slot. The lock is
+	# held on fd 9 until this container exits, so it can't go stale. Slot 0 is
+	# /nix/docker; others are /nix/docker-<n>. Run dockerd from / so its
+	# children don't use the bind-mounted checkout as their working directory;
+	# a crashing child would otherwise leave a core file there.
+	mkdir -p /nix/docker-locks
+	slot=0
+	while :; do
+		exec 9>"/nix/docker-locks/${slot}"
+		flock -n 9 && break
+		slot=$((slot + 1))
+	done
+	data_root=/nix/docker
+	if [ "${slot}" -gt 0 ]; then
+		data_root="/nix/docker-${slot}"
+	fi
+	echo "nix.sh: using Docker data root ${data_root}" >&2
+	(cd / && exec dockerd --data-root="${data_root}" >/tmp/dockerd.log 2>&1 9>&-) &
 
 	attempts=0
 	until docker info >/dev/null 2>&1; do
