@@ -19,8 +19,6 @@ package generator
 import (
 	"strings"
 	"unicode"
-
-	"github.com/gobuffalo/flect"
 )
 
 // Rust types the emitter refers to. Everything outside the prelude is written
@@ -214,35 +212,13 @@ func rustNestedTypeName(owner, field string) string {
 	return owner + rustUpperCamelCase(field)
 }
 
-// rustItemTypeName returns the name for the struct generated from the items of
-// an array whose own type name would be nested. It singularizes the last word,
-// so an inline object under "resourceRefs" becomes <Owner>ResourceRef. Names
-// whose last word has no distinct singular form get an Item suffix instead.
+// rustItemTypeName returns the name for the type generated from the items of
+// an array whose own type name would be nested: an Item suffix, as the Go and
+// Python models name theirs. Singularizing the field name reads better for
+// resourceRefs, but turns data into Datum and criteria into Criterion, and a
+// name a reader has to guess at is worse than a dull one.
 func rustItemTypeName(nested string) string {
-	words := rustSplitWords(nested)
-	if len(words) == 0 {
-		return nested + "Item"
-	}
-
-	last := words[len(words)-1]
-	singular := flect.Singularize(last)
-	if strings.EqualFold(singular, last) || !strings.HasSuffix(nested, last) {
-		return nested + "Item"
-	}
-
-	// Replace only the last word, so the rest of the name keeps the spelling it
-	// inherited from its parent type.
-	return strings.TrimSuffix(nested, last) + rustUpperFirst(singular)
-}
-
-// rustUpperFirst uppercases the first rune of s, leaving the rest alone.
-func rustUpperFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	rs := []rune(s)
-	rs[0] = unicode.ToUpper(rs[0])
-	return string(rs)
+	return nested + "Item"
 }
 
 // rustModuleSegment sanitizes one segment of a component schema name into a

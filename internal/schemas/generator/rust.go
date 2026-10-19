@@ -105,7 +105,7 @@ func (rustGenerator) Language() string {
 // GenerateFromCRD generates Rust models for the XRDs and CRDs in the given
 // filesystem.
 func (rustGenerator) GenerateFromCRD(_ context.Context, fromFS afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
-	openAPIs, err := goCollectOpenAPIs(fromFS)
+	openAPIs, err := collectCRDOpenAPIs(fromFS)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +123,7 @@ func (rustGenerator) GenerateFromCRD(_ context.Context, fromFS afero.Fs, _ runne
 		if oapi.spec.Components == nil {
 			continue
 		}
-		goRemoveValidationOnlyCombinators(oapi.spec)
+		removeValidationOnlyCombinators(oapi.spec)
 		maps.Copy(schemas, oapi.spec.Components.Schemas)
 	}
 
@@ -148,8 +148,8 @@ func (rustGenerator) GenerateFromOpenAPI(_ context.Context, fromFS afero.Fs, _ r
 		// from crd.ToOpenAPI, schemas from a live API server carry a
 		// group-version-kind extension we have to turn into defaults
 		// ourselves. They are what marks a type as a root, see rustRootOf.
-		goAddDefaults(oapi)
-		goRemoveValidationOnlyCombinators(oapi)
+		addGVKDefaults(oapi)
+		removeValidationOnlyCombinators(oapi)
 		maps.Copy(schemas, oapi.Components.Schemas)
 	}
 
@@ -229,7 +229,7 @@ func rustGenerateModels(schemas map[string]*spec.Schema) (afero.Fs, error) {
 // CRD refers to, and the OpenAPI flow emits all of them. The schema manager
 // copies each source's output over the last and never deletes, so both flows
 // have to produce those files identically, whichever runs last. They would not:
-// goAddDefaults gives Status and DeleteOptions an apiVersion and kind in the
+// addGVKDefaults gives Status and DeleteOptions an apiVersion and kind in the
 // OpenAPI flow only, which would make them resources there, with consts and a
 // Default impl. Nobody composes those types, so they are plain structs in both
 // flows instead.
@@ -627,7 +627,7 @@ func rustScalarVariant(s *spec.Schema) rustVariant {
 // rustRootOf returns the apiVersion and kind of a schema that describes a
 // Kubernetes resource, or nil if it does not. Both properties carry a default
 // for exactly those schemas: crd.ToOpenAPI sets them for the kind a CRD
-// defines, and goAddDefaults derives them from the group-version-kind extension
+// defines, and addGVKDefaults derives them from the group-version-kind extension
 // of a schema served by an API server.
 func rustRootOf(s *spec.Schema) *rustRoot {
 	apiVersion, ok := s.Properties["apiVersion"]

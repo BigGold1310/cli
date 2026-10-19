@@ -210,7 +210,7 @@ pub struct WidgetSpec {
     pub replicas: Option<i32>,
 
     #[serde(rename = "rules", default, skip_serializing_if = "Option::is_none")]
-    pub rules: Option<Vec<WidgetSpecRule>>,
+    pub rules: Option<Vec<WidgetSpecRulesItem>>,
 
     /// How the widget is wired up.
     ///
@@ -234,7 +234,7 @@ pub enum WidgetSpecPort {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WidgetSpecRule {
+pub struct WidgetSpecRulesItem {
     #[serde(rename = "port", default, skip_serializing_if = "Option::is_none")]
     pub port: Option<i32>,
 }
@@ -873,7 +873,7 @@ func TestGenerateFromOpenAPIRust(t *testing.T) {
 					"models/src/io/k8s/api/core/v1/pod.rs": {
 						"pub struct Pod {",
 						// Schemas served by an API server declare their GVK in
-						// an extension, which goAddDefaults turns into the
+						// an extension, which addGVKDefaults turns into the
 						// defaults we key on.
 						`pub const API_VERSION: &str = "v1";`,
 						`pub const KIND: &str = "Pod";`,

@@ -317,24 +317,17 @@ func TestRustItemTypeName(t *testing.T) {
 		want struct{ item string }
 	}{
 		"Plural": {
-			args: struct{ nested string }{nested: "XAccountScaffoldStatusConditions"},
-			want: struct{ item string }{item: "XAccountScaffoldStatusCondition"},
-		},
-		"PluralAbbreviation": {
 			args: struct{ nested string }{nested: "XAccountScaffoldSpecResourceRefs"},
-			want: struct{ item string }{item: "XAccountScaffoldSpecResourceRef"},
+			want: struct{ item string }{item: "XAccountScaffoldSpecResourceRefsItem"},
 		},
-		"KeepsParentSpelling": {
-			args: struct{ nested string }{nested: "JSONSchemaPropsEnums"},
-			want: struct{ item string }{item: "JSONSchemaPropsEnum"},
+		// Singularizing would give Datum, which nobody looks for.
+		"LatinPlural": {
+			args: struct{ nested string }{nested: "WidgetSpecData"},
+			want: struct{ item string }{item: "WidgetSpecDataItem"},
 		},
 		"AlreadySingular": {
 			args: struct{ nested string }{nested: "BucketSpecForProvider"},
 			want: struct{ item string }{item: "BucketSpecForProviderItem"},
-		},
-		"Unpluralizable": {
-			args: struct{ nested string }{nested: "PodSpecStatus"},
-			want: struct{ item string }{item: "PodSpecStatusItem"},
 		},
 	}
 
