@@ -45,10 +45,13 @@ if [ "${NIX_SH_CONTAINER:-}" = "1" ]; then
 	# by the host user. Git refuses to operate in directories owned by other
 	# users.
 	git config --global --add safe.directory /crossplane-cli
-	# In a worktree, git also checks the ownership of the mounted git
-	# directories, whose paths vary. The container is ephemeral, so trust all.
-	if [ -n "${WORKTREE_GIT_DIRS:-}" ]; then
-		git config --global --add safe.directory '*'
+	# In a worktree, git also checks the ownership of the mounted worktree
+	# and git directories, which are mounted at their host paths.
+	if [ -n "${WORKTREE_DIR:-}" ]; then
+		git config --global --add safe.directory /crossplane-cli/.git
+		git config --global --add safe.directory "${WORKTREE_DIR}"
+		git config --global --add safe.directory "${WORKTREE_GIT_DIR}"
+		git config --global --add safe.directory "${WORKTREE_COMMON_DIR}"
 	fi
 
 	# Record the current time. After nix runs, we'll find files newer than this
@@ -77,7 +80,9 @@ if [ "${NIX_SH_CONTAINER:-}" = "1" ]; then
 	# Fix ownership of any files nix created or modified. The container runs as
 	# root, so without this, generated files would be root-owned on the host.
 	# Using -newer is surgical - we only chown files touched during this run.
-	find /crossplane-cli -newer "${marker}" -exec chown "${HOST_UID}:${HOST_GID}" {} + 2>/dev/null || true
+	# In a worktree this also covers the shared git directory, which git
+	# commands run by nix may have written to.
+	find /crossplane-cli "${WORKTREE_COMMON_DIR:-/crossplane-cli}" -newer "${marker}" -exec chown "${HOST_UID}:${HOST_GID}" {} + 2>/dev/null || true
 	rm -f "${marker}"
 
 	exit 0
@@ -121,12 +126,13 @@ fi
 # so git (and Nix's flake evaluation) can resolve the repository.
 WORKTREE_FLAGS=()
 if [ -f .git ]; then
+	worktree_dir=$(pwd -P)
 	git_dir=$(git rev-parse --absolute-git-dir)
 	git_common_dir=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
 	git_file=$(mktemp)
 	trap 'rm -f "${git_file}"' EXIT
 	echo "gitdir: ${git_dir}" >"${git_file}"
-	WORKTREE_FLAGS=(-e "WORKTREE_GIT_DIRS=${git_dir} ${git_common_dir}" -v "$(pwd -P):$(pwd -P)" -v "${git_common_dir}:${git_common_dir}" -v "${git_file}:/crossplane-cli/.git:ro")
+	WORKTREE_FLAGS=(-e "WORKTREE_DIR=${worktree_dir}" -e "WORKTREE_GIT_DIR=${git_dir}" -e "WORKTREE_COMMON_DIR=${git_common_dir}" -v "${worktree_dir}:${worktree_dir}" -v "${git_common_dir}:${git_common_dir}" -v "${git_file}:/crossplane-cli/.git:ro")
 fi
 
 # Run with --privileged for Docker-in-Docker (required for kind clusters).
