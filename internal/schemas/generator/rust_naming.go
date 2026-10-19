@@ -57,13 +57,14 @@ var rustKeywords = map[string]bool{
 	"typeof": true, "unsized": true, "virtual": true, "yield": true,
 }
 
-// rustPreludeTypes are type names the generated code uses unqualified. A
-// generated type of the same name would shadow them, so it gets a trailing
-// underscore.
+// rustPreludeTypes are the names from the prelude the generated code uses
+// unqualified: the types it wraps fields in, and the Default trait every
+// resource implements. A generated type of the same name would shadow them, so
+// it gets a trailing underscore.
 //
 //nolint:gochecknoglobals // Effectively a constant; Go has no constant maps.
 var rustPreludeTypes = map[string]bool{
-	"Box": true, "Option": true, "String": true, "Vec": true,
+	"Box": true, "Default": true, "Option": true, "String": true, "Vec": true,
 }
 
 // rustSplitWords splits an identifier into its words. Boundaries are:

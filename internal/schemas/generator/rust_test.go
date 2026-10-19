@@ -86,25 +86,27 @@ func rustTestDefault(s spec.Schema, def string) spec.Schema {
 	return s
 }
 
-// rustTestEmit renders the file the named schema leads, going through the real
-// grouping so a test sees what the generator would write.
+// rustTestAnyOf builds an inline choice of scalars, which is what a CRD's
+// x-kubernetes-int-or-string is once converted to OpenAPI.
+func rustTestAnyOf(variants ...spec.Schema) spec.Schema {
+	return spec.Schema{SchemaProps: spec.SchemaProps{AnyOf: variants}}
+}
+
+// rustTestEmit renders the file of the named schema, as the generator would
+// write it.
 func rustTestEmit(t *testing.T, name string, schemas map[string]*spec.Schema) string {
 	t.Helper()
 
-	boxed := rustDetectCycles(schemas)
-	for _, group := range rustGroupSchemas(schemas) {
-		if group.primary == name {
-			return string(rustEmitFile(group, schemas, boxed))
-		}
+	if _, ok := schemas[name]; !ok {
+		t.Fatalf("no schema named %q", name)
 	}
-	t.Fatalf("no file is named after schema %q", name)
-	return ""
+	return string(rustEmitFile(name, schemas, rustDetectCycles(schemas)))
 }
 
 // TestRustEmitSchemaFile locks the shape of the generated code: field
-// attributes, optionality, type mapping, the naming of inline structs, and the
-// consts and Default impl that let a function build a resource without naming
-// its group and version.
+// attributes, optionality, type mapping, the naming of inline structs and
+// enums, and the consts and Default impl that let a function build a resource
+// without naming its group and version.
 func TestRustEmitSchemaFile(t *testing.T) {
 	t.Parallel()
 
@@ -118,7 +120,7 @@ func TestRustEmitSchemaFile(t *testing.T) {
 		}
 	}{
 		"Resource": {
-			reason: "A resource's fields are optional and renamed to their wire names, each kind of schema maps to its Rust type, inline objects become structs named after their path, and a root gets its consts and a Default impl.",
+			reason: "A resource's fields are optional and renamed to their wire names, each kind of schema maps to its Rust type, inline objects and choices of scalars become types named after their path, and a root gets its consts and a Default impl.",
 			args: struct{ schemas map[string]*spec.Schema }{schemas: map[string]*spec.Schema{
 				"io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta": {SchemaProps: rustTestObject(map[string]spec.Schema{
 					"name": rustTestScalar("string", ""),
@@ -135,6 +137,7 @@ func TestRustEmitSchemaFile(t *testing.T) {
 						"type":     rustTestSchema(rustTestEnum("Static", "Dynamic"), "How the widget is wired up."),
 						"labels":   rustTestMap(rustTestScalar("string", "")),
 						"hosts":    rustTestArray(rustTestScalar("string", "")),
+						"port":     rustTestSchema(rustTestAnyOf(rustTestScalar("integer", ""), rustTestScalar("string", "")), "The port, by number or name."),
 						"rules": rustTestArray(rustTestObject(map[string]spec.Schema{
 							"port": rustTestScalar("integer", "int32"),
 						})),
@@ -196,6 +199,10 @@ pub struct WidgetSpec {
     #[serde(rename = "labels", default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<std::collections::BTreeMap<String, String>>,
 
+    /// The port, by number or name.
+    #[serde(rename = "port", default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<WidgetSpecPort>,
+
     #[serde(rename = "ratio", default, skip_serializing_if = "Option::is_none")]
     pub ratio: Option<f64>,
 
@@ -216,6 +223,14 @@ pub struct WidgetSpec {
 
     #[serde(rename = "weight", default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<i64>,
+}
+
+/// The port, by number or name.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum WidgetSpecPort {
+    Int(i64),
+    String(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -434,89 +449,33 @@ func TestRustReferenceToUnknownSchemaFallsBack(t *testing.T) {
 	}
 }
 
-// TestRustFileOwner covers which file a schema is emitted into. The Kubernetes
-// API names a kind's helper types after it, which is what makes grouping by
-// name prefix work; the cases that don't are the interesting ones.
-func TestRustFileOwner(t *testing.T) {
-	t.Parallel()
-
-	kinds := map[string]bool{
-		"Pod":         true,
-		"PodList":     true,
-		"PodTemplate": true,
-		"Service":     true,
-		"ServiceList": true,
-	}
-
-	cases := map[string]struct {
-		reason string
-		args   struct{ typ string }
-		want   struct{ owner string }
-	}{
-		"KindOwnsItself": {
-			reason: "A kind is emitted into a file of its own.",
-			args:   struct{ typ string }{typ: "Pod"},
-			want:   struct{ owner string }{owner: "Pod"},
-		},
-		"ListJoinsItsKind": {
-			reason: "A <Kind>List wraps its kind, so it is emitted with it.",
-			args:   struct{ typ string }{typ: "PodList"},
-			want:   struct{ owner string }{owner: "Pod"},
-		},
-		"HelperJoinsItsKind": {
-			reason: "A type named after a kind is one of its helpers.",
-			args:   struct{ typ string }{typ: "PodSpec"},
-			want:   struct{ owner string }{owner: "Pod"},
-		},
-		"LongestKindPrefixWins": {
-			reason: "PodTemplate is a kind of its own, so its helpers are its own, not Pod's.",
-			args:   struct{ typ string }{typ: "PodTemplateSpec"},
-			want:   struct{ owner string }{owner: "PodTemplate"},
-		},
-		"KindIsNotSwallowedByAShorterKind": {
-			reason: "A kind keeps its own file even when a shorter kind's name starts it.",
-			args:   struct{ typ string }{typ: "PodTemplate"},
-			want:   struct{ owner string }{owner: "PodTemplate"},
-		},
-		"PrefixMustEndAWord": {
-			reason: "A prefix only counts at a word boundary, or Pod would own every type whose name merely starts with those three letters.",
-			args:   struct{ typ string }{typ: "Podium"},
-			want:   struct{ owner string }{owner: "Podium"},
-		},
-		"SharedTypeKeepsItsOwnFile": {
-			reason: "A type named after no kind keeps a file of its own.",
-			args:   struct{ typ string }{typ: "ObjectMeta"},
-			want:   struct{ owner string }{owner: "ObjectMeta"},
-		},
-	}
-
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			got := struct{ owner string }{owner: rustFileOwner(tc.args.typ, kinds)}
-			if diff := cmp.Diff(tc.want, got, cmp.AllowUnexported(got)); diff != "" {
-				t.Errorf("\n%s\nrustFileOwner(%q): -want, +got:\n%s", tc.reason, tc.args.typ, diff)
-			}
-		})
-	}
-}
-
-// TestRustGroupSchemas covers the grouping end to end, on the shape a
-// Kubernetes OpenAPI document has: a kind, its list, its spec and status as
-// separate component schemas, plus shared types named after no kind.
-func TestRustGroupSchemas(t *testing.T) {
+// TestRustFileDependsOnNameAlone pins the layout rule: a component schema is
+// emitted into a file named after its type, whatever else its source holds. The
+// schema manager copies every source's output into one crate and deletes
+// nothing, so a type whose file depended on the kinds a source knows about
+// would end up declared twice once two sources, or two versions of one,
+// disagreed about them.
+func TestRustFileDependsOnNameAlone(t *testing.T) {
 	t.Parallel()
 
 	kind := func(k string) *spec.Schema {
 		s := rustTestObject(map[string]spec.Schema{
-			"apiVersion": rustTestDefault(rustTestScalar("string", ""), "apps/v1"),
+			"apiVersion": rustTestDefault(rustTestScalar("string", ""), "v1"),
 			"kind":       rustTestDefault(rustTestScalar("string", ""), k),
+			"spec":       rustTestRef("io.k8s.api.core.v1.PodSpec"),
+		})
+		return &spec.Schema{SchemaProps: s.SchemaProps}
+	}
+	list := func(k string) *spec.Schema {
+		s := rustTestObject(map[string]spec.Schema{
+			"apiVersion": rustTestDefault(rustTestScalar("string", ""), "v1"),
+			"kind":       rustTestDefault(rustTestScalar("string", ""), k),
+			"items":      rustTestArray(rustTestRef("io.k8s.api.core.v1.Pod")),
 		})
 		return &spec.Schema{SchemaProps: s.SchemaProps}
 	}
 	helper := func() *spec.Schema {
-		s := rustTestObject(map[string]spec.Schema{"name": rustTestScalar("string", "")})
+		s := rustTestObject(map[string]spec.Schema{"hostname": rustTestScalar("string", "")})
 		return &spec.Schema{SchemaProps: s.SchemaProps}
 	}
 
@@ -526,38 +485,30 @@ func TestRustGroupSchemas(t *testing.T) {
 			schemas map[string]*spec.Schema
 		}
 		want struct {
-			// files is the schemas each file holds, the one it is named after
-			// first.
+			// files is the types each file of the crate declares.
 			files map[string][]string
 		}
 	}{
-		"KindWithListAndHelpers": {
-			reason: "A kind's list, spec and status are emitted with it, and a schema named after no kind keeps a file of its own.",
+		"WithItsKind": {
+			reason: "A kind, its list and its helper types get a file each.",
 			args: struct{ schemas map[string]*spec.Schema }{schemas: map[string]*spec.Schema{
-				"io.k8s.api.apps.v1.Deployment":                   kind("Deployment"),
-				"io.k8s.api.apps.v1.DeploymentList":               kind("DeploymentList"),
-				"io.k8s.api.apps.v1.DeploymentSpec":               helper(),
-				"io.k8s.api.apps.v1.DeploymentStatus":             helper(),
-				"io.k8s.api.apps.v1.DeploymentStrategy":           helper(),
-				"io.k8s.api.apps.v1.RollingUpdateDeployment":      helper(),
-				"io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta": helper(),
+				"io.k8s.api.core.v1.Pod":     kind("Pod"),
+				"io.k8s.api.core.v1.PodList": list("PodList"),
+				"io.k8s.api.core.v1.PodSpec": helper(),
 			}},
 			want: struct{ files map[string][]string }{files: map[string][]string{
-				"src/io/k8s/api/apps/v1/deployment.rs": {
-					"io.k8s.api.apps.v1.Deployment",
-					"io.k8s.api.apps.v1.DeploymentList",
-					"io.k8s.api.apps.v1.DeploymentSpec",
-					"io.k8s.api.apps.v1.DeploymentStatus",
-					"io.k8s.api.apps.v1.DeploymentStrategy",
-				},
-				// Named after no kind, so it keeps its own file even though a
-				// reader might expect it under Deployment.
-				"src/io/k8s/api/apps/v1/rollingupdatedeployment.rs": {
-					"io.k8s.api.apps.v1.RollingUpdateDeployment",
-				},
-				"src/io/k8s/apimachinery/pkg/apis/meta/v1/objectmeta.rs": {
-					"io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
-				},
+				"src/io/k8s/api/core/v1/pod.rs":     {"Pod"},
+				"src/io/k8s/api/core/v1/podlist.rs": {"PodList"},
+				"src/io/k8s/api/core/v1/podspec.rs": {"PodSpec"},
+			}},
+		},
+		"WithoutItsKind": {
+			reason: "A source that carries a helper type without its kind writes the same file for it.",
+			args: struct{ schemas map[string]*spec.Schema }{schemas: map[string]*spec.Schema{
+				"io.k8s.api.core.v1.PodSpec": helper(),
+			}},
+			want: struct{ files map[string][]string }{files: map[string][]string{
+				"src/io/k8s/api/core/v1/podspec.rs": {"PodSpec"},
 			}},
 		},
 	}
@@ -566,13 +517,33 @@ func TestRustGroupSchemas(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
+			schemaFS, err := rustGenerateModels(tc.args.schemas)
+			if err != nil {
+				t.Fatalf("\n%s\nrustGenerateModels(...): %v", tc.reason, err)
+			}
+			crateFS := afero.NewBasePathFs(schemaFS, rustModelsDir)
+			assertValidRustCrate(t, crateFS)
+
 			got := make(map[string][]string)
-			for _, g := range rustGroupSchemas(tc.args.schemas) {
-				got[path.Join(g.dir, g.stem+".rs")] = g.schemas
+			err = afero.Walk(crateFS, rustSrcDir, func(p string, info fs.FileInfo, err error) error {
+				if err != nil || info.IsDir() || !rustIsTypeFile(info.Name()) {
+					return err
+				}
+				contents, err := afero.ReadFile(crateFS, p)
+				if err != nil {
+					return err
+				}
+				for _, m := range rustTypeDeclRE.FindAllStringSubmatch(string(contents), -1) {
+					got[p] = append(got[p], m[1])
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
 
 			if diff := cmp.Diff(tc.want.files, got); diff != "" {
-				t.Errorf("\n%s\nrustGroupSchemas(...): -want, +got:\n%s", tc.reason, diff)
+				t.Errorf("\n%s\ntypes per file: -want, +got:\n%s", tc.reason, diff)
 			}
 		})
 	}
@@ -588,17 +559,15 @@ func TestGenerateFromCRDRust(t *testing.T) {
 		}
 		want struct {
 			present []string
-			absent  []string
 			// contains is the code a generated file must contain.
 			contains map[string][]string
 		}
 	}{
 		"CRDsAndXRDs": {
-			reason: "Every CRD and XRD is generated into one valid crate, in which a resource carries its own group, version and kind, and a list is emitted with the kind it wraps.",
+			reason: "Every CRD and XRD is generated into one valid crate, in which a resource carries its own group, version and kind, and every component schema has a file of its own.",
 			args:   struct{ input afero.Fs }{input: afero.NewBasePathFs(afero.FromIOFS{FS: testdataFS}, "testdata")},
 			want: struct {
 				present  []string
-				absent   []string
 				contains map[string][]string
 			}{
 				present: []string{
@@ -606,6 +575,7 @@ func TestGenerateFromCRDRust(t *testing.T) {
 					"models/src/lib.rs",
 					"models/src/co/acme/platform/v1alpha1/mod.rs",
 					"models/src/co/acme/platform/v1alpha1/xaccountscaffold.rs",
+					"models/src/co/acme/platform/v1alpha1/xaccountscaffoldlist.rs",
 					"models/src/co/acme/platform/v1alpha1/accountscaffold.rs",
 					"models/src/io/upbound/azure/web/v1beta2/linuxfunctionapp.rs",
 					"models/src/io/cilium/v2/ciliumclusterwidenetworkpolicy.rs",
@@ -613,9 +583,6 @@ func TestGenerateFromCRDRust(t *testing.T) {
 					"models/src/io/k8s/apimachinery/pkg/apis/meta/v1/objectmeta.rs",
 					"models/src/io/k8s/apimachinery/pkg/apis/meta/v1/time.rs",
 				},
-				// The list type is emitted with the kind it wraps rather than in
-				// a file of its own.
-				absent: []string{"models/src/co/acme/platform/v1alpha1/xaccountscaffoldlist.rs"},
 				contains: map[string][]string{
 					"models/src/co/acme/platform/v1alpha1/xaccountscaffold.rs": {
 						// The XR is a resource, so it carries its own group,
@@ -631,8 +598,11 @@ func TestGenerateFromCRDRust(t *testing.T) {
 						"pub struct XAccountScaffoldSpecParameters {",
 						// Shared Kubernetes types are referenced, not inlined.
 						"pub metadata: Option<crate::io::k8s::apimachinery::pkg::apis::meta::v1::ObjectMeta>,",
-						// The list must not become a second XAccountScaffold.
+					},
+					// The list wraps the kind from a file of its own.
+					"models/src/co/acme/platform/v1alpha1/xaccountscaffoldlist.rs": {
 						"pub struct XAccountScaffoldList {",
+						"pub items: Option<Vec<crate::co::acme::platform::v1alpha1::XAccountScaffold>>,",
 					},
 				},
 			},
@@ -657,15 +627,6 @@ func TestGenerateFromCRDRust(t *testing.T) {
 					t.Errorf("\n%s\nexpected model file %s does not exist", tc.reason, p)
 				}
 			}
-			for _, p := range tc.want.absent {
-				exists, err := afero.Exists(schemaFS, p)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if exists {
-					t.Errorf("\n%s\n%s was emitted instead of being grouped with its kind", tc.reason, p)
-				}
-			}
 
 			assertValidRustCrate(t, afero.NewBasePathFs(schemaFS, "models"))
 
@@ -677,6 +638,141 @@ func TestGenerateFromCRDRust(t *testing.T) {
 				for _, want := range contains {
 					if !strings.Contains(string(contents), want) {
 						t.Errorf("\n%s\n%s is missing %q", tc.reason, p, want)
+					}
+				}
+			}
+		})
+	}
+}
+
+// rustTestCRD renders a CRD of the given kind, in group example.com, whose
+// spec has the given properties.
+func rustTestCRD(kind, plural, properties string) string {
+	return `apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ` + plural + `.example.com
+spec:
+  group: example.com
+  names:
+    kind: ` + kind + `
+    listKind: ` + kind + `List
+    plural: ` + plural + `
+    singular: ` + strings.TrimSuffix(plural, "s") + `
+  scope: Namespaced
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+` + properties
+}
+
+// TestGenerateFromCRDRustShapes covers CRD shapes the testdata does not have,
+// through the real CRD to OpenAPI conversion: a field that is an integer or a
+// string, and a kind named after a trait the generated code implements.
+func TestGenerateFromCRDRustShapes(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		reason string
+		args   struct {
+			crd string
+		}
+		want struct {
+			// contains is the code a generated file must contain, and
+			// notContains the code it must not.
+			contains    map[string][]string
+			notContains map[string][]string
+		}
+	}{
+		"IntOrString": {
+			reason: "A CRD's x-kubernetes-int-or-string field, which its OpenAPI conversion renders as a choice of integer and string, becomes an untagged enum rather than an untyped value.",
+			args: struct{ crd string }{crd: rustTestCRD("Gateway", "gateways", `              port:
+                description: The port, by number or name.
+                x-kubernetes-int-or-string: true
+`)},
+			want: struct {
+				contains    map[string][]string
+				notContains map[string][]string
+			}{
+				contains: map[string][]string{
+					"models/src/com/example/v1/gateway.rs": {
+						"pub port: Option<GatewaySpecPort>,",
+						"#[serde(untagged)]\npub enum GatewaySpecPort {\n    Int(i64),\n    String(String),\n}",
+					},
+				},
+				notContains: map[string][]string{
+					"models/src/com/example/v1/gateway.rs": {"pub port: Option<serde_json::Value>,"},
+				},
+			},
+		},
+		"KindNamedDefault": {
+			reason: "A kind named Default would shadow the Default trait its own file implements, so its type takes a trailing underscore while its kind on the wire stays Default.",
+			args: struct{ crd string }{crd: rustTestCRD("Default", "defaults", `              value:
+                type: string
+`)},
+			want: struct {
+				contains    map[string][]string
+				notContains map[string][]string
+			}{
+				contains: map[string][]string{
+					"models/src/com/example/v1/default_.rs": {
+						"pub struct Default_ {",
+						`pub const KIND: &str = "Default";`,
+						"impl Default for Default_ {",
+					},
+					"models/src/com/example/v1/defaultlist.rs": {
+						"pub items: Option<Vec<crate::com::example::v1::Default_>>,",
+					},
+				},
+				notContains: map[string][]string{
+					"models/src/com/example/v1/default_.rs": {"pub struct Default {"},
+				},
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			input := afero.NewMemMapFs()
+			if err := afero.WriteFile(input, "crd.yaml", []byte(tc.args.crd), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			schemaFS, err := rustGenerator{}.GenerateFromCRD(t.Context(), input, nil)
+			if err != nil {
+				t.Fatalf("\n%s\nGenerateFromCRD(...): %v", tc.reason, err)
+			}
+			assertValidRustCrate(t, afero.NewBasePathFs(schemaFS, "models"))
+
+			for p, contains := range tc.want.contains {
+				contents, err := afero.ReadFile(schemaFS, p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, want := range contains {
+					if !strings.Contains(string(contents), want) {
+						t.Errorf("\n%s\n%s is missing %q:\n%s", tc.reason, p, want, contents)
+					}
+				}
+			}
+			for p, notContains := range tc.want.notContains {
+				contents, err := afero.ReadFile(schemaFS, p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, unwanted := range notContains {
+					if strings.Contains(string(contents), unwanted) {
+						t.Errorf("\n%s\n%s contains %q", tc.reason, p, unwanted)
 					}
 				}
 			}
@@ -749,31 +845,29 @@ func TestGenerateFromOpenAPIRust(t *testing.T) {
 		}
 		want struct {
 			present []string
-			absent  []string
 			// contains is the code a generated file must contain.
 			contains map[string][]string
 		}
 	}{
 		"KubernetesDocuments": {
-			reason: "Documents served by an API server are generated into one valid crate, in which a kind takes its group, version and kind from its extension and is emitted with its helpers.",
+			reason: "Documents served by an API server are generated into one valid crate, in which a kind takes its group, version and kind from its extension and every component schema has a file of its own.",
 			args:   struct{ input afero.Fs }{input: afero.NewBasePathFs(afero.FromIOFS{FS: testdataJSONFS}, "testdata")},
 			want: struct {
 				present  []string
-				absent   []string
 				contains map[string][]string
 			}{
 				present: []string{
 					"models/Cargo.toml",
 					"models/src/lib.rs",
 					"models/src/io/k8s/api/core/v1/pod.rs",
+					"models/src/io/k8s/api/core/v1/podlist.rs",
+					"models/src/io/k8s/api/core/v1/podspec.rs",
+					"models/src/io/k8s/api/core/v1/podtemplate.rs",
+					"models/src/io/k8s/api/core/v1/podtemplatespec.rs",
 					"models/src/io/k8s/api/resource/v1/deviceclass.rs",
 					"models/src/io/k8s/apimachinery/pkg/apis/meta/v1/objectmeta.rs",
 					"models/src/io/k8s/apimachinery/pkg/api/resource/quantity.rs",
 					"models/src/io/k8s/apimachinery/pkg/util/intstr/intorstring.rs",
-				},
-				absent: []string{
-					"models/src/io/k8s/api/core/v1/podspec.rs",
-					"models/src/io/k8s/api/core/v1/podlist.rs",
 				},
 				contains: map[string][]string{
 					"models/src/io/k8s/api/core/v1/pod.rs": {
@@ -784,20 +878,14 @@ func TestGenerateFromOpenAPIRust(t *testing.T) {
 						`pub const API_VERSION: &str = "v1";`,
 						`pub const KIND: &str = "Pod";`,
 						"pub metadata: Option<crate::io::k8s::apimachinery::pkg::apis::meta::v1::ObjectMeta>,",
-						"pub spec: Option<crate::io::k8s::api::core::v1::PodSpec>,",
 						// Kubernetes documents declare a kind's helpers as
-						// component schemas of their own; they are emitted with
-						// the kind rather than one file each.
-						"pub struct PodSpec {",
-						"pub struct PodStatus {",
-						"pub struct PodList {",
+						// component schemas of their own, each in a file of its
+						// own, so they are referenced by path.
+						"pub spec: Option<crate::io::k8s::api::core::v1::PodSpec>,",
 					},
-					// A kind of its own keeps its own file, and takes its own
-					// helpers with it.
-					"models/src/io/k8s/api/core/v1/podtemplate.rs": {
-						"pub struct PodTemplate {",
-						"pub struct PodTemplateSpec {",
-					},
+					"models/src/io/k8s/api/core/v1/podspec.rs":         {"pub struct PodSpec {"},
+					"models/src/io/k8s/api/core/v1/podlist.rs":         {"pub struct PodList {"},
+					"models/src/io/k8s/api/core/v1/podtemplatespec.rs": {"pub struct PodTemplateSpec {"},
 				},
 			},
 		},
@@ -819,15 +907,6 @@ func TestGenerateFromOpenAPIRust(t *testing.T) {
 				}
 				if !exists {
 					t.Errorf("\n%s\nexpected model file %s does not exist", tc.reason, p)
-				}
-			}
-			for _, p := range tc.want.absent {
-				exists, err := afero.Exists(schemaFS, p)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if exists {
-					t.Errorf("\n%s\n%s was emitted instead of being grouped with its kind", tc.reason, p)
 				}
 			}
 
@@ -930,9 +1009,8 @@ func TestGenerateRustFlowsAgree(t *testing.T) {
 }
 
 // TestRustSharedTypesAreNeverKinds pins the rule the flows agree by: a shared
-// Kubernetes type is a plain struct in a file of its own even when its schema
-// says it is a resource, which the OpenAPI flow's does for Status and the CRD
-// flow's does not.
+// Kubernetes type is a plain struct even when its schema says it is a resource,
+// which the OpenAPI flow's does for Status and the CRD flow's does not.
 func TestRustSharedTypesAreNeverKinds(t *testing.T) {
 	t.Parallel()
 
@@ -952,7 +1030,7 @@ func TestRustSharedTypesAreNeverKinds(t *testing.T) {
 		}
 	}{
 		"StatusDeclaredAsAResource": {
-			reason: "A shared type must not be treated as a resource, nor have the types named after it grouped into its file.",
+			reason: "A shared type must not be treated as a resource, however its schema declares it.",
 			args: struct{ schemas map[string]*spec.Schema }{schemas: map[string]*spec.Schema{
 				"io.k8s.apimachinery.pkg.apis.meta.v1.Status": object(map[string]spec.Schema{
 					"apiVersion": rustTestDefault(rustTestEnum("v1"), "v1"),

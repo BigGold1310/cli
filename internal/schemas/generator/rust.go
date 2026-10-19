@@ -23,8 +23,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/spf13/afero"
 	"k8s.io/kube-openapi/pkg/validation/spec"
@@ -190,17 +188,26 @@ func rustGenerateModels(schemas map[string]*spec.Schema) (afero.Fs, error) {
 		}
 	}
 
+	// One file per component schema, named after its type. The schema manager
+	// copies every source's output into one crate and deletes nothing, so a
+	// type has to land in the same file whichever source emits it and whatever
+	// else that source knows about. A file named from the schema alone is what
+	// guarantees it; a layout that grouped a kind's helpers with it would move
+	// a type between files as kinds came and went across sources and versions,
+	// and leave it declared twice.
 	written := make(map[string]string, len(names))
-	for _, group := range rustGroupSchemas(schemas) {
-		if err := crateFS.MkdirAll(group.dir, 0o755); err != nil {
-			return nil, errors.Wrapf(err, "failed to create directory %q", group.dir)
+	for _, name := range names {
+		module, typ := rustSplitSchemaName(name)
+		dir := rustModuleDir(module)
+		if err := crateFS.MkdirAll(dir, 0o755); err != nil {
+			return nil, errors.Wrapf(err, "failed to create directory %q", dir)
 		}
 
-		file := rustFilePath(group.dir, group.stem, dirs, written)
-		written[file] = group.primary
+		file := rustFilePath(dir, rustFileStem(typ), dirs, written)
+		written[file] = name
 
-		if err := afero.WriteFile(crateFS, file, rustEmitFile(group, schemas, boxed), 0o644); err != nil {
-			return nil, errors.Wrapf(err, "failed to write models for schema %q", group.primary)
+		if err := afero.WriteFile(crateFS, file, rustEmitFile(name, schemas, boxed), 0o644); err != nil {
+			return nil, errors.Wrapf(err, "failed to write models for schema %q", name)
 		}
 	}
 
@@ -223,9 +230,9 @@ func rustGenerateModels(schemas map[string]*spec.Schema) (afero.Fs, error) {
 // copies each source's output over the last and never deletes, so both flows
 // have to produce those files identically, whichever runs last. They would not:
 // goAddDefaults gives Status and DeleteOptions an apiVersion and kind in the
-// OpenAPI flow only, which would make them resources there, with consts, a
-// Default impl and the types named after them grouped into their file. Nobody
-// composes those types, so they are plain structs in both flows instead.
+// OpenAPI flow only, which would make them resources there, with consts and a
+// Default impl. Nobody composes those types, so they are plain structs in both
+// flows instead.
 func rustPrepareSchemas(schemas map[string]*spec.Schema) {
 	for name, s := range schemas {
 		if _, typ := rustSplitSchemaName(name); typ == "" {
@@ -250,127 +257,6 @@ func rustPrepareSchemas(schemas map[string]*spec.Schema) {
 // rustModuleDir returns the directory holding a module path's types.
 func rustModuleDir(module []string) string {
 	return path.Join(append([]string{rustSrcDir}, module...)...)
-}
-
-// rustFileGroup is the set of component schemas emitted into one file, named
-// after the kind they belong to.
-type rustFileGroup struct {
-	dir     string
-	stem    string
-	primary string   // the schema the file is named after
-	schemas []string // every schema in the file, sorted, primary first
-}
-
-// rustGroupSchemas decides which file each component schema is emitted into.
-// Everything that belongs to a kind is emitted with it, so a CronJob's spec,
-// status and list types are in cronjob.rs rather than three files of their own:
-//
-//   - a kind gets its own file;
-//   - a <Kind>List kind is emitted with its <Kind>, being a wrapper around it
-//     rather than a resource anyone composes;
-//   - anything else joins the kind whose name it starts with, longest name
-//     first, which is how the Kubernetes API names a kind's helper types
-//     (PodSpec, PodTemplateSpec, DeploymentStrategy);
-//   - a schema named after no kind keeps its own file (ObjectMeta, Container,
-//     LabelSelector).
-//
-// Grouping depends on which kinds a source knows about, so it is only safe for
-// files a single source writes. The shared Kubernetes types are written by
-// every source; rustPrepareSchemas makes sure none of them is a kind, which
-// leaves each of them in a file of its own.
-//
-// The result is sorted, so the emitted crate does not depend on map order.
-func rustGroupSchemas(schemas map[string]*spec.Schema) []rustFileGroup {
-	type schemaInfo struct{ name, typ string }
-
-	byDir := make(map[string][]schemaInfo)
-	kinds := make(map[string]map[string]bool)
-	for _, name := range slices.Sorted(maps.Keys(schemas)) {
-		module, typ := rustSplitSchemaName(name)
-		dir := rustModuleDir(module)
-
-		byDir[dir] = append(byDir[dir], schemaInfo{name: name, typ: typ})
-		if rustRootOf(schemas[name]) != nil {
-			if kinds[dir] == nil {
-				kinds[dir] = make(map[string]bool)
-			}
-			kinds[dir][typ] = true
-		}
-	}
-
-	groups := make([]rustFileGroup, 0, len(schemas))
-	for _, dir := range slices.Sorted(maps.Keys(byDir)) {
-		owners := make(map[string][]string)
-		primaries := make(map[string]string)
-
-		for _, s := range byDir[dir] {
-			owner := rustFileOwner(s.typ, kinds[dir])
-			owners[owner] = append(owners[owner], s.name)
-			if s.typ == owner {
-				primaries[owner] = s.name
-			}
-		}
-
-		for _, owner := range slices.Sorted(maps.Keys(owners)) {
-			names := owners[owner]
-			slices.Sort(names)
-
-			// The kind leads its file. A file grouped under a kind whose own
-			// schema we never saw (a dangling reference) is named after it
-			// anyway, and its first schema leads.
-			primary := primaries[owner]
-			if primary == "" {
-				primary = names[0]
-			} else if i := slices.Index(names, primary); i > 0 {
-				names = slices.Concat([]string{primary}, names[:i], names[i+1:])
-			}
-
-			groups = append(groups, rustFileGroup{
-				dir:     dir,
-				stem:    rustFileStem(owner),
-				primary: primary,
-				schemas: names,
-			})
-		}
-	}
-
-	return groups
-}
-
-// rustFileOwner returns the type whose file typ is emitted into, given the
-// kinds its module defines. See rustGroupSchemas for the rules.
-func rustFileOwner(typ string, kinds map[string]bool) string {
-	if kinds[typ] {
-		if base, ok := strings.CutSuffix(typ, "List"); ok && kinds[base] {
-			return base
-		}
-		return typ
-	}
-
-	owner := ""
-	for kind := range kinds {
-		if len(kind) <= len(owner) || !rustNamePrefix(typ, kind) {
-			continue
-		}
-		owner = kind
-	}
-	if owner == "" {
-		return typ
-	}
-
-	// The owning kind may itself be emitted with another kind.
-	return rustFileOwner(owner, kinds)
-}
-
-// rustNamePrefix reports whether name starts with prefix at a word boundary,
-// so Pod owns PodSpec but not Podium.
-func rustNamePrefix(name, prefix string) bool {
-	rest, ok := strings.CutPrefix(name, prefix)
-	if !ok || rest == "" {
-		return false
-	}
-	r, _ := utf8.DecodeRuneInString(rest)
-	return unicode.IsUpper(r)
 }
 
 // rustFilePath returns the file to write a type to, keeping clear of directory
@@ -433,7 +319,8 @@ type rustRoot struct {
 }
 
 // rustFile accumulates the types emitted into a single file: the type generated
-// for its component schema, plus one struct per inline object nested in it.
+// for its component schema, plus one struct per inline object and one enum per
+// inline choice of scalars nested in it.
 type rustFile struct {
 	schema string                  // the component schema being emitted
 	all    map[string]*spec.Schema // every known schema, for $ref resolution
@@ -443,31 +330,23 @@ type rustFile struct {
 	types []rustType
 }
 
-// rustEmitFile renders a group of component schemas, and every inline object
-// nested in them, into the contents of one Rust file.
-func rustEmitFile(group rustFileGroup, all map[string]*spec.Schema, boxed map[rustEdge]bool) []byte {
-	f := &rustFile{all: all, boxed: boxed, names: make(map[string]bool)}
+// rustEmitFile renders a component schema, and every inline type nested in it,
+// into the contents of one Rust file.
+func rustEmitFile(name string, all map[string]*spec.Schema, boxed map[rustEdge]bool) []byte {
+	f := &rustFile{schema: name, all: all, boxed: boxed, names: make(map[string]bool)}
 
-	// Reserve the component schemas' own names before emitting anything. Other
-	// files refer to them by an absolute crate path derived from the schema
-	// name, so a component type must always get the name that path expects; an
-	// inline object that would collide with one gives way instead.
-	types := make([]string, len(group.schemas))
-	for i, name := range group.schemas {
-		_, typ := rustSplitSchemaName(name)
-		types[i] = f.reserve(typ)
-	}
-
-	for i, name := range group.schemas {
-		f.schema = name
-		f.addNamedType(types[i], all[name])
-	}
+	// Reserve the component schema's own name before emitting anything. Other
+	// files refer to it by an absolute crate path derived from the schema name,
+	// so the component type must always get the name that path expects; an
+	// inline type that would collide with it gives way instead.
+	_, typ := rustSplitSchemaName(name)
+	f.reserve(typ)
+	f.addNamedType(typ, all[name])
 
 	slices.SortFunc(f.types, func(a, b rustType) int { return strings.Compare(a.name, b.name) })
 
-	// The kind the file is named after leads it; everything else, including the
-	// inline structs, follows in name order.
-	if i := slices.IndexFunc(f.types, func(t rustType) bool { return t.name == types[0] }); i > 0 {
+	// The component type leads its file; the inline types follow in name order.
+	if i := slices.IndexFunc(f.types, func(t rustType) bool { return t.name == typ }); i > 0 {
 		lead := f.types[i]
 		f.types = slices.Concat([]rustType{lead}, f.types[:i], f.types[i+1:])
 	}
@@ -592,10 +471,11 @@ func rustReserveIdent(taken map[string]bool, ident string) string {
 }
 
 // typeFor maps a property schema to the Rust type expression for it, adding a
-// struct to the file for every inline object it walks through. nested is the
-// name to give the struct if this position turns out to be one. indirect says
-// whether the position is already behind a Vec or a BTreeMap, in which case a
-// reference does not need boxing to have a finite size.
+// type to the file for every inline object, and every inline choice of scalars,
+// it walks through. nested is the name to give that type if this position turns
+// out to be one. indirect says whether the position is already behind a Vec or
+// a BTreeMap, in which case a reference does not need boxing to have a finite
+// size.
 //
 // An unknown or unstructured shape maps to serde_json::Value rather than
 // failing: a model that deserializes every observed resource is worth more than
@@ -614,6 +494,7 @@ func (f *rustFile) typeFor(nested string, s *spec.Schema, depth int, indirect bo
 		return f.typeFor(nested, &s.AllOf[0], depth+1, indirect)
 	}
 
+	variants := rustScalarVariants(s)
 	switch {
 	case s.Type.Contains("array"):
 		if s.Items == nil || s.Items.Schema == nil {
@@ -631,6 +512,18 @@ func (f *rustFile) typeFor(nested string, s *spec.Schema, depth int, indirect bo
 		// BTreeMap rather than HashMap: its serialization is ordered, which
 		// keeps a function's output stable.
 		return rustMapType + "<" + rustStringType + ", " + f.typeFor(nested+"Value", s.AdditionalProperties.Schema, depth+1, true) + ">"
+
+	case len(variants) > 0:
+		// An inline choice of scalars, which is what a CRD's
+		// x-kubernetes-int-or-string is once converted to OpenAPI, becomes an
+		// untagged enum named after its path, as a named choice does. A
+		// choice of one scalar is that scalar.
+		if len(variants) == 1 {
+			return variants[0].typ
+		}
+		name := f.reserve(nested)
+		f.types = append(f.types, rustType{name: name, doc: s.Description, kind: rustUntagged, variants: variants})
+		return name
 
 	case s.Type.Contains("string"):
 		// Including format: byte, date-time and password. Keeping them all
@@ -651,8 +544,8 @@ func (f *rustFile) typeFor(nested string, s *spec.Schema, depth int, indirect bo
 	}
 
 	// Objects without properties (x-kubernetes-preserve-unknown-fields,
-	// embedded resources, RawExtension), inline unions such as
-	// x-kubernetes-int-or-string, and schemas with no type at all.
+	// embedded resources, RawExtension), choices involving objects, and
+	// schemas with no type at all.
 	return rustValueType
 }
 

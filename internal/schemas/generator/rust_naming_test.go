@@ -126,6 +126,14 @@ func TestRustCasing(t *testing.T) {
 				snake: "string", camel: "String", field: "string", typ: "String_",
 			},
 		},
+		// Every resource implements Default, so a kind of that name would
+		// shadow the trait in its own file.
+		"PreludeTraitName": {
+			args: struct{ in string }{in: "default"},
+			want: struct{ snake, camel, field, typ string }{
+				snake: "default", camel: "Default", field: "default", typ: "Default_",
+			},
+		},
 		"KeywordAsRawIdent": {
 			args: struct{ in string }{in: "type"},
 			want: struct{ snake, camel, field, typ string }{
@@ -278,6 +286,10 @@ func TestRustSchemaNames(t *testing.T) {
 		"KeywordStem": {
 			args: struct{ schema string }{schema: "com.example.v1.Type"},
 			want: struct{ path, stem string }{path: "crate::com::example::v1::Type", stem: "type_"},
+		},
+		"PreludeTrait": {
+			args: struct{ schema string }{schema: "com.example.v1.Default"},
+			want: struct{ path, stem string }{path: "crate::com::example::v1::Default_", stem: "default_"},
 		},
 	}
 
