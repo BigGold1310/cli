@@ -301,48 +301,65 @@ func (c *generateCmd) generateKCLFiles(fs afero.Fs) error {
 	return renderTemplates(fs, tmpls, tmplData)
 }
 
+// schemasInfo reports whether the project has generated models for a language
+// and the path at which a function of this project depends on them, relative
+// to the function's directory. A schemas directory that exists but is empty
+// counts as no models.
+func (c *generateCmd) schemasInfo(lang string) (bool, string, error) {
+	hasSchemas, err := afero.DirExists(c.schemasFS, lang)
+	if err != nil {
+		return false, "", errors.Wrapf(err, "cannot inspect %s schemas directory", lang)
+	}
+	if hasSchemas {
+		entries, err := afero.ReadDir(c.schemasFS, lang)
+		if err != nil {
+			return false, "", errors.Wrapf(err, "cannot read %s schemas directory", lang)
+		}
+		hasSchemas = len(entries) > 0
+	}
+
+	fnDir := filepath.Join("/", c.proj.Spec.Paths.Functions, c.Name)
+	relRoot, err := filepath.Rel(fnDir, "/")
+	if err != nil {
+		return false, "", errors.Wrap(err, "cannot determine path to schemas directory")
+	}
+
+	return hasSchemas, filepath.ToSlash(filepath.Join(relRoot, c.proj.Spec.Paths.Schemas, lang)), nil
+}
+
+// renderTemplateTree renders the templates in root into targetFS, and the
+// templates in root's sub directory into that directory of targetFS.
+// template.ParseFS does not walk subdirectories, so a scaffold laid out on two
+// levels is rendered in two passes.
+func renderTemplateTree(targetFS afero.Fs, templates fs.FS, root, sub string, data any) error {
+	tmpls := template.Must(template.ParseFS(templates, path.Join(root, "*.*")))
+	if err := renderTemplates(targetFS, tmpls, data); err != nil {
+		return err
+	}
+
+	if err := targetFS.Mkdir(sub, 0o755); err != nil {
+		return errors.Wrapf(err, "cannot create %s directory", sub)
+	}
+	tmpls = template.Must(template.ParseFS(templates, path.Join(root, sub, "*.*")))
+	return renderTemplates(afero.NewBasePathFs(targetFS, sub), tmpls, data)
+}
+
 type pythonTemplateData struct {
 	HasSchemas  bool
 	SchemasPath string
 }
 
 func (c *generateCmd) generatePythonFiles(targetFS afero.Fs) error {
-	hasSchemas, err := afero.DirExists(c.schemasFS, "python")
+	hasSchemas, schemasPath, err := c.schemasInfo("python")
 	if err != nil {
-		return errors.Wrap(err, "cannot inspect python schemas directory")
-	}
-	if hasSchemas {
-		entries, err := afero.ReadDir(c.schemasFS, "python")
-		if err != nil {
-			return errors.Wrap(err, "cannot read python schemas directory")
-		}
-		hasSchemas = len(entries) > 0
+		return err
 	}
 
-	// Compute the relative path from the function dir to schemas/python/.
-	fnDir := filepath.Join("/", c.proj.Spec.Paths.Functions, c.Name)
-	relRoot, err := filepath.Rel(fnDir, "/")
-	if err != nil {
-		return errors.Wrap(err, "cannot determine path to schemas directory")
-	}
-	schemasPath := filepath.ToSlash(filepath.Join(relRoot, c.proj.Spec.Paths.Schemas, "python"))
-
-	// template.ParseFS doesn't handle subdirectories, so we need to template
-	// the top-level directory and the 'function' sub-directory separately.
 	data := pythonTemplateData{
 		HasSchemas:  hasSchemas,
 		SchemasPath: schemasPath,
 	}
-	tmpls := template.Must(template.ParseFS(pythonTemplates, "templates/python/*.*"))
-	if err := renderTemplates(targetFS, tmpls, data); err != nil {
-		return err
-	}
-
-	if err := targetFS.Mkdir("function", 0o755); err != nil {
-		return errors.Wrap(err, "cannot create function directory")
-	}
-	tmpls = template.Must(template.ParseFS(pythonTemplates, "templates/python/function/*.*"))
-	return renderTemplates(afero.NewBasePathFs(targetFS, "function"), tmpls, data)
+	return renderTemplateTree(targetFS, pythonTemplates, "templates/python", "function", data)
 }
 
 type rustTemplateData struct {
@@ -352,43 +369,17 @@ type rustTemplateData struct {
 }
 
 func (c *generateCmd) generateRustFiles(targetFS afero.Fs) error {
-	hasSchemas, err := afero.DirExists(c.schemasFS, "rust")
+	hasSchemas, schemasPath, err := c.schemasInfo("rust")
 	if err != nil {
-		return errors.Wrap(err, "cannot inspect rust schemas directory")
-	}
-	if hasSchemas {
-		entries, err := afero.ReadDir(c.schemasFS, "rust")
-		if err != nil {
-			return errors.Wrap(err, "cannot read rust schemas directory")
-		}
-		hasSchemas = len(entries) > 0
+		return err
 	}
 
-	// Compute the relative path from the function dir to schemas/rust/.
-	fnDir := filepath.Join("/", c.proj.Spec.Paths.Functions, c.Name)
-	relRoot, err := filepath.Rel(fnDir, "/")
-	if err != nil {
-		return errors.Wrap(err, "cannot determine path to schemas directory")
-	}
-	schemasPath := filepath.ToSlash(filepath.Join(relRoot, c.proj.Spec.Paths.Schemas, "rust"))
-
-	// template.ParseFS doesn't handle subdirectories, so we need to template
-	// the top-level directory and the 'src' sub-directory separately.
 	data := rustTemplateData{
 		Name:        c.Name,
 		HasSchemas:  hasSchemas,
 		SchemasPath: schemasPath,
 	}
-	tmpls := template.Must(template.ParseFS(rustTemplates, "templates/rust/*.*"))
-	if err := renderTemplates(targetFS, tmpls, data); err != nil {
-		return err
-	}
-
-	if err := targetFS.Mkdir("src", 0o755); err != nil {
-		return errors.Wrap(err, "cannot create src directory")
-	}
-	tmpls = template.Must(template.ParseFS(rustTemplates, "templates/rust/src/*.*"))
-	return renderTemplates(afero.NewBasePathFs(targetFS, "src"), tmpls, data)
+	return renderTemplateTree(targetFS, rustTemplates, "templates/rust", "src", data)
 }
 
 type goTemplateData struct {
