@@ -33,6 +33,7 @@ import (
 	"github.com/crossplane/cli/v2/internal/async"
 	"github.com/crossplane/cli/v2/internal/config"
 	"github.com/crossplane/cli/v2/internal/dependency"
+	"github.com/crossplane/cli/v2/internal/git"
 	"github.com/crossplane/cli/v2/internal/project"
 	"github.com/crossplane/cli/v2/internal/project/functions"
 	"github.com/crossplane/cli/v2/internal/project/projectfile"
@@ -46,6 +47,8 @@ var buildHelp string
 
 // buildCmd builds a project into Crossplane packages.
 type buildCmd struct {
+	git.HTTPSAuthFlags `embed:""`
+
 	ProjectFile    string `default:"${project_file}"                           help:"Path to project definition."                 short:"f"`
 	Repository     string `help:"Override the repository in the project file." optional:""`
 	OutputDir      string `default:"_output"                                   help:"Output directory for packages."              short:"o"`
@@ -94,7 +97,9 @@ func (c *buildCmd) Run(logger logging.Logger, sp terminal.SpinnerPrinter, cfg *c
 	concurrency := max(1, c.MaxConcurrency)
 
 	schemaMgr := project.NewSchemaManager(c.proj, c.projFS, cfg.Features)
-	depMgr, err := dependency.NewCachedManager(c.proj, c.projFS, c.ProjectFile, c.CacheDir)
+	depMgr, err := dependency.NewCachedManager(c.proj, c.projFS, c.ProjectFile, c.CacheDir,
+		dependency.WithGitAuthProvider(c.AuthProvider()),
+	)
 	if err != nil {
 		return err
 	}

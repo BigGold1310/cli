@@ -27,6 +27,11 @@ versions the lock pins, which works offline when the packages are cached. Run
 `crossplane schema update` to accept changes and update the lock, or
 `crossplane schema generate` to restore modified files.
 
+Creating the lock or recreating missing schema files may clone git
+dependencies. The build authenticates with the same `--git-token` and
+`--git-username` flags, or the `CROSSPLANE_GIT_TOKEN` and
+`CROSSPLANE_GIT_USERNAME` environment variables, as `dependency add`.
+
 The CLI builds embedded functions onto a runtime base image from a registry, and
 caches those image layers on disk under `crossplane/base-images` in your user
 cache directory. A build that needs a layer already in the cache reads it

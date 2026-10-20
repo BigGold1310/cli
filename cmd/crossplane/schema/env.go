@@ -35,9 +35,9 @@ type ProjectFlags struct {
 
 // SourceFlags are the flags commands need to fetch the project's dependencies.
 type SourceFlags struct {
-	CacheDir    string `env:"CROSSPLANE_XPKG_CACHE" help:"Directory for cached xpkg package contents." name:"cache-dir"`
-	GitToken    string `env:"CROSSPLANE_GIT_TOKEN"  help:"Token for git HTTPS authentication."`
-	GitUsername string `default:"x-access-token"    env:"CROSSPLANE_GIT_USERNAME"                      help:"Username for git HTTPS authentication."`
+	git.HTTPSAuthFlags `embed:""`
+
+	CacheDir string `env:"CROSSPLANE_XPKG_CACHE" help:"Directory for cached xpkg package contents." name:"cache-dir"`
 }
 
 // env is everything a schema command works with: the project, its schema
@@ -68,7 +68,7 @@ func newEnv(projectFile string, cfg *config.Config, src *SourceFlags) (*env, err
 	}
 
 	e.deps, err = dependency.NewCachedManager(proj, projFS, projectFile, src.CacheDir,
-		dependency.WithGitAuthProvider(&git.HTTPSAuthProvider{Username: src.GitUsername, Password: src.GitToken}),
+		dependency.WithGitAuthProvider(src.AuthProvider()),
 	)
 	if err != nil {
 		return nil, err

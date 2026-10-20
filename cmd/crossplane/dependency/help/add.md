@@ -20,6 +20,11 @@ dependencies. Use the `--api-only` flag to add a build-time xpkg dependency.
 
 Non-xpkg dependencies are always build-time dependencies.
 
+Git repositories are accessed over HTTPS. Use `--git-token` (or the
+`CROSSPLANE_GIT_TOKEN` environment variable) to authenticate, and
+`--git-username` (or `CROSSPLANE_GIT_USERNAME`, default `x-access-token`) to set
+the username.
+
 ## Examples
 
 Retrieve the latest available semantic version of `provider-aws-eks` and add it
@@ -56,4 +61,13 @@ build-time dependency:
 ```shell
 crossplane dependency add https://github.com/kubernetes-sigs/cluster-api \
     --git-ref=release-1.11 --git-path=config/crd/bases
+```
+
+Add CRDs from a private git repository, authenticating with a token from the
+environment:
+
+```shell
+export CROSSPLANE_GIT_TOKEN=<token>
+crossplane dependency add https://<git-server>/<org>/<repo>.git \
+    --git-ref=main --git-path=config/crd/bases
 ```

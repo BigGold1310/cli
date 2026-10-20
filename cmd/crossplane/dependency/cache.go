@@ -40,10 +40,10 @@ var updateHelp string
 // updateCacheCmd refreshes the shared xpkg package cache and fetches the
 // project's other dependencies.
 type updateCacheCmd struct {
+	git.HTTPSAuthFlags `embed:""`
+
 	ProjectFile string `default:"${project_file}"   help:"Path to project definition file."            short:"f"`
 	CacheDir    string `env:"CROSSPLANE_XPKG_CACHE" help:"Directory for cached xpkg package contents." name:"cache-dir"`
-	GitToken    string `env:"CROSSPLANE_GIT_TOKEN"  help:"Token for git HTTPS authentication."`
-	GitUsername string `default:"x-access-token"    env:"CROSSPLANE_GIT_USERNAME"                      help:"Username for git HTTPS authentication."`
 }
 
 func (c *updateCacheCmd) Help() string {
@@ -72,7 +72,7 @@ func (c *updateCacheCmd) Run(logger logging.Logger, sp terminal.SpinnerPrinter) 
 
 // gitAuth returns the git authentication configured by the command's flags.
 func (c *updateCacheCmd) gitAuth() git.AuthProvider {
-	return &git.HTTPSAuthProvider{Username: c.GitUsername, Password: c.GitToken}
+	return c.AuthProvider()
 }
 
 //go:embed help/clean-cache.md

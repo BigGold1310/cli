@@ -27,6 +27,7 @@ import (
 
 	"github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/dependency"
+	"github.com/crossplane/cli/v2/internal/git"
 	"github.com/crossplane/cli/v2/internal/project/projectfile"
 	"github.com/crossplane/cli/v2/internal/terminal"
 
@@ -38,6 +39,8 @@ var addHelp string
 
 // addCmd adds a dependency to the current project.
 type addCmd struct {
+	git.HTTPSAuthFlags `embed:""`
+
 	Package     string `arg:""                      help:"Package to add (xpkg OCI reference, k8s:<version>, git repository URL, or HTTP(S) URL)."`
 	ProjectFile string `default:"${project_file}"   help:"Path to project definition file."                                                        short:"f"`
 	CacheDir    string `env:"CROSSPLANE_XPKG_CACHE" help:"Directory for cached xpkg package contents."                                             name:"cache-dir"`
@@ -61,7 +64,9 @@ func (c *addCmd) Run(logger logging.Logger, sp terminal.SpinnerPrinter) error {
 		return err
 	}
 
-	m, err := dependency.NewCachedManager(proj, projFS, c.ProjectFile, c.CacheDir)
+	m, err := dependency.NewCachedManager(proj, projFS, c.ProjectFile, c.CacheDir,
+		dependency.WithGitAuthProvider(c.AuthProvider()),
+	)
 	if err != nil {
 		return err
 	}
