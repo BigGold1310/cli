@@ -320,6 +320,10 @@ func (fakeSchemaGenerator) GenerateFromOpenAPI(_ context.Context, _ afero.Fs, _ 
 	return nil, nil
 }
 
+func (fakeSchemaGenerator) Fingerprint() string {
+	return "fake"
+}
+
 // failingClient is an xpkg client that fails the test on any call, to prove a
 // build doesn't touch the registry.
 type failingClient struct {
@@ -355,6 +359,10 @@ func (perFileGenerator) GenerateFromCRD(_ context.Context, from afero.Fs, _ runn
 
 func (perFileGenerator) GenerateFromOpenAPI(_ context.Context, _ afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
 	return nil, nil
+}
+
+func (perFileGenerator) Fingerprint() string {
+	return "perfile"
 }
 
 func TestBuilderBuild_VerifiesSchemas(t *testing.T) {

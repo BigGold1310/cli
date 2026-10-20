@@ -108,6 +108,12 @@ func UpdateSchemas(ctx context.Context, sm *manager.Manager, dm *dependency.Mana
 		return nil, err
 	}
 
+	// Run-level languages describe the union of all sources, so they are
+	// generated last, once the source set is final.
+	if err := sm.Finalize(ctx, sources); err != nil {
+		return nil, errors.Wrap(err, "cannot generate run-level schemas")
+	}
+
 	depsHash, err := dependency.DependenciesHash(proj)
 	if err != nil {
 		return nil, err
