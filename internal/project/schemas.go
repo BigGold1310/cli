@@ -48,6 +48,7 @@ func NewSchemaManager(proj *v1alpha1.Project, projFS afero.Fs, features config.F
 		generators,
 		runner.NewRealSchemaRunner(runner.WithImageConfig(proj.Spec.ImageConfigs)),
 		manager.WithFlags(manager.FlagsFor(proj.Spec.Schemas, features.GenerateGoRuntimeObjects)),
+		manager.WithPartCache(afero.NewBasePathFs(afero.NewOsFs(), manager.DefaultPartCacheDir())),
 	)
 }
 

@@ -21,9 +21,13 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	crversion "github.com/crossplane/crossplane-runtime/v2/pkg/version"
+
+	"github.com/crossplane/cli/v2/internal/schemas/generator"
 )
 
 const (
@@ -46,6 +50,14 @@ type Flags struct {
 
 func (f Flags) equal(o Flags) bool {
 	return f.GoRuntimeObjects == o.GoRuntimeObjects && slices.Equal(f.APIGroups, o.APIGroups)
+}
+
+// parts returns the flags as strings to hash.
+func (f Flags) parts() []string {
+	return []string{
+		"goRuntimeObjects=" + strconv.FormatBool(f.GoRuntimeObjects),
+		"apiGroups=" + strings.Join(f.APIGroups, ","),
+	}
 }
 
 // lock tracks the sources whose schemas are present in the manager and the
@@ -73,14 +85,14 @@ type lockSource struct {
 	// Version is the resolved tag or ref, shown to people. It is optional.
 	Version string `json:"version,omitempty"`
 	// Generator is a fingerprint of everything outside the source that
-	// determines what the generators produced from it: the CLI build version
-	// and each generator's own fingerprint (its pinned toolchain image and
-	// options). It is recorded per source, not once for the lock, because a
-	// pass that fails partway leaves some sources generated under the new
-	// fingerprint and others under the old one. Files made under a different
-	// fingerprint are stale, so an upgraded CLI that changes generator output
-	// forces `schema update` instead of mysteriously failing `schema
-	// generate`.
+	// determines what the per-source generators produced from it: the CLI
+	// build version and each generator's own fingerprint (its pinned
+	// toolchain image and options). It is recorded per source, not once for
+	// the lock, because a pass that fails partway leaves some sources
+	// generated under the new fingerprint and others under the old one. An
+	// entry made under another fingerprint is stale: `schema update`
+	// regenerates it, and `schema status` and builds say so, but its files
+	// still describe the source, so builds don't fail on it.
 	Generator string `json:"generator,omitempty"`
 	Flags     Flags  `json:"flags"`
 	// Languages are the sorted languages the source was generated for. They
@@ -98,7 +110,8 @@ type lockRun struct {
 	// generated from. The run is fresh only when this exactly matches the
 	// live sources.
 	Sources map[string]string `json:"sources"`
-	// Generator is the generator fingerprint the run files were made under.
+	// Generator is the fingerprint of the run-level generator the run files
+	// were made by.
 	Generator string `json:"generator,omitempty"`
 	// Flags are the generation flags the run files were made with.
 	Flags Flags      `json:"flags"`
@@ -183,24 +196,53 @@ func hashContent(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// generatorFingerprint hashes everything outside the sources that determines
-// what the configured generators produce. Each generator contributes its
-// language and its own Fingerprint() -- its pinned toolchain image and
-// options -- so any change that alters what a generator produces also
-// changes the fingerprint and marks locked files stale. m.languages() is
-// sorted, so the parts are stable for the same generator set.
-func (m *Manager) generatorFingerprint() string {
-	parts := make([]string, 0, len(m.generators)+1)
-	parts = append(parts, "cli="+crversion.New().GetVersionString())
+// sourceFingerprint fingerprints the generators a per-source lock entry is
+// made by: every configured generator that is not run-level. Run-level
+// generators are left out, so adding or changing one never makes per-source
+// entries stale.
+func (m *Manager) sourceFingerprint() string {
+	var gens []generator.Interface
 	for _, g := range m.generators {
+		if _, ok := g.(schemaMerger); !ok {
+			gens = append(gens, g)
+		}
+	}
+	return fingerprint(gens)
+}
+
+// runFingerprint fingerprints the one generator a run-level language's lock
+// entry is made by, so changing another language never makes it stale.
+func (m *Manager) runFingerprint(lang string) string {
+	if g := m.generatorFor(lang); g != nil {
+		return fingerprint([]generator.Interface{g})
+	}
+	return ""
+}
+
+// fingerprint hashes everything outside the sources that determines what the
+// given generators produce: the CLI build version, and each generator's
+// language and own Fingerprint() -- its pinned toolchain image and options --
+// so any change that alters what a generator produces also changes the
+// fingerprint and marks locked files stale. Generators are taken in language
+// order, so the result does not depend on how they were configured.
+func fingerprint(gens []generator.Interface) string {
+	parts := make([]string, 0, len(gens)+1)
+	parts = append(parts, "cli="+crversion.New().GetVersionString())
+	for _, g := range gens {
 		parts = append(parts, g.Language()+"="+g.Fingerprint())
 	}
+	slices.Sort(parts[1:])
 	return hashParts(parts)
 }
 
 // hashParts returns a short hex digest of the given strings, each length-
 // prefixed so no two different part lists can hash the same.
 func hashParts(parts []string) string {
+	return hashPartsFull(parts)[:16]
+}
+
+// hashPartsFull is hashParts with the full SHA-256 digest.
+func hashPartsFull(parts []string) string {
 	h := sha256.New()
 	var lenBuf [8]byte
 	for _, p := range parts {
@@ -208,5 +250,5 @@ func hashParts(parts []string) string {
 		_, _ = h.Write(lenBuf[:])
 		_, _ = h.Write([]byte(p))
 	}
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hex.EncodeToString(h.Sum(nil))
 }
