@@ -48,6 +48,7 @@ func NewSchemaManager(proj *v1alpha1.Project, projFS afero.Fs, features config.F
 		generators,
 		runner.NewRealSchemaRunner(runner.WithImageConfig(proj.Spec.ImageConfigs)),
 		manager.WithFlags(manager.FlagsFor(proj.Spec.Schemas, features.GenerateGoRuntimeObjects)),
+		manager.WithPartCache(afero.NewBasePathFs(afero.NewOsFs(), manager.DefaultPartCacheDir())),
 	)
 }
 
@@ -106,6 +107,12 @@ func UpdateSchemas(ctx context.Context, sm *manager.Manager, dm *dependency.Mana
 	res, err := sm.Reconcile(ctx, sources)
 	if err != nil {
 		return nil, err
+	}
+
+	// Run-level languages describe the union of all sources, so they are
+	// generated last, once the source set is final.
+	if err := sm.Finalize(ctx, sources); err != nil {
+		return nil, errors.Wrap(err, "cannot generate run-level schemas")
 	}
 
 	depsHash, err := dependency.DependenciesHash(proj)

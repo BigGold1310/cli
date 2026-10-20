@@ -17,10 +17,14 @@ limitations under the License.
 package manager
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io/fs"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -274,7 +278,7 @@ func TestManager_Add(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(tc.want.lock, gotLock); diff != "" {
+			if diff := cmp.Diff(tc.want.lock, gotLock, cmpopts.IgnoreFields(lockSource{}, "Generator")); diff != "" {
 				t.Errorf("%s\nlock: -want, +got:\n%s", tc.reason, diff)
 			}
 			if diff := cmp.Diff(tc.want.files, readFiles(t, memFS)); diff != "" {
@@ -672,6 +676,8 @@ func (echoGenerator) GenerateFromOpenAPI(_ context.Context, _ afero.Fs, _ runner
 	return nil, nil
 }
 
+func (echoGenerator) Fingerprint() string { return "echo" }
+
 func TestManager_LocalSourcesIgnoreAPIGroups(t *testing.T) {
 	t.Parallel()
 
@@ -797,7 +803,7 @@ func TestManager_LocalSourcesIgnoreAPIGroups(t *testing.T) {
 			if diff := cmp.Diff(tc.want.files, readFiles(t, memFS)); diff != "" {
 				t.Errorf("%s\nfiles: -want, +got:\n%s", tc.reason, diff)
 			}
-			if diff := cmp.Diff(tc.want.lock, l.Sources); diff != "" {
+			if diff := cmp.Diff(tc.want.lock, l.Sources, cmpopts.IgnoreFields(lockSource{}, "Generator")); diff != "" {
 				t.Errorf("%s\nlock sources: -want, +got:\n%s", tc.reason, diff)
 			}
 		})
@@ -967,6 +973,64 @@ func (g *mockGenerator) GenerateFromOpenAPI(_ context.Context, _ afero.Fs, _ run
 	return nil, nil
 }
 
+func (g *mockGenerator) Fingerprint() string {
+	return "mock"
+}
+
+// mockRunGenerator is a run-level generator (see schemaMerger): it writes a
+// root file describing every source it saw, and merges parts by
+// concatenating their root files. Like the TypeScript generator, its merge
+// walks the models/ directory, so it fails if a part reaches it in any layout
+// other than the generator's own.
+type mockRunGenerator struct {
+	lang  string
+	files map[string]string
+}
+
+func (g *mockRunGenerator) Language() string { return g.lang }
+
+func (g *mockRunGenerator) GenerateFromCRD(_ context.Context, _ afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	if len(g.files) == 0 {
+		return nil, nil
+	}
+	fs := afero.NewMemMapFs()
+	for path, contents := range g.files {
+		if err := afero.WriteFile(fs, path, []byte(contents), 0o600); err != nil {
+			return nil, err
+		}
+	}
+	return fs, nil
+}
+
+func (g *mockRunGenerator) GenerateFromOpenAPI(_ context.Context, _ afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	return nil, nil
+}
+
+func (g *mockRunGenerator) Fingerprint() string { return "mock-run" }
+
+func (g *mockRunGenerator) MergeGeneratedSchemas(parts []afero.Fs) (afero.Fs, error) {
+	out := afero.NewMemMapFs()
+	for i, part := range parts {
+		err := afero.Walk(part, "models", func(p string, info fs.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			content, err := afero.ReadFile(part, p)
+			if err != nil {
+				return err
+			}
+			// Concatenate: the merged root file names every part, unlike a
+			// file-copy merge where the last part would silently win.
+			prev, _ := afero.ReadFile(out, p)
+			return afero.WriteFile(out, p, append(append(prev, []byte(fmt.Sprintf("part%d\n", i))...), content...), 0o600)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 type mockSource struct {
 	key  string
 	hash string
@@ -1063,6 +1127,751 @@ func mustFSHash(t *testing.T) string {
 	return h
 }
 
+// echoSource returns a source whose echoGenerator output is the given files.
+func echoSource(key, hash string, files map[string]string) *mockSource {
+	fs := afero.NewMemMapFs()
+	for p, content := range files {
+		_ = afero.WriteFile(fs, p, []byte(content), 0o600)
+	}
+	return &mockSource{key: key, hash: hash, fs: fs}
+}
+
+func TestManager_AddConflictingSources(t *testing.T) {
+	t.Parallel()
+
+	// Each pass is one `schema update`: a new manager that Adds every live
+	// source in order, then Reconciles.
+	type pass struct {
+		sources []*mockSource
+		errMsg  string
+	}
+	cases := map[string]struct {
+		reason string
+		passes []pass
+		want   map[string]string
+	}{
+		"IdenticalSharedFilesAreAllowed": {
+			reason: "Two sources producing the same shared model byte-identically is normal, not a conflict.",
+			passes: []pass{{sources: []*mockSource{
+				echoSource("xpkg://a", "h1", map[string]string{"a.json": "A", "shared.json": "S"}),
+				echoSource("xpkg://b", "h1", map[string]string{"b.json": "B", "shared.json": "S"}),
+			}}},
+			want: map[string]string{"echo/a.json": "A", "echo/b.json": "B", "echo/shared.json": "S"},
+		},
+		"ChangedSourceAfterSettledSourceIsRejected": {
+			reason: "A changed source that disagrees with an already settled source must fail without overwriting its file.",
+			passes: []pass{
+				{sources: []*mockSource{echoSource("xpkg://a", "h1", map[string]string{"shared.json": "S"})}},
+				{sources: []*mockSource{
+					echoSource("xpkg://a", "h1", map[string]string{"shared.json": "S"}),
+					echoSource("xpkg://b", "h1", map[string]string{"shared.json": "DIFFERENT"}),
+				}, errMsg: "shared.json was also generated differently by xpkg://a"},
+			},
+			want: map[string]string{"echo/shared.json": "S"},
+		},
+		"ChangedSourceBeforeSettledSourceIsRejected": {
+			reason: "The conflict must be found whichever order the sources are Added in.",
+			passes: []pass{
+				{sources: []*mockSource{echoSource("xpkg://a", "h1", map[string]string{"shared.json": "S"})}},
+				{sources: []*mockSource{
+					echoSource("xpkg://b", "h1", map[string]string{"shared.json": "DIFFERENT"}),
+					echoSource("xpkg://a", "h1", map[string]string{"shared.json": "S"}),
+				}, errMsg: "shared.json was also generated differently by xpkg://b"},
+			},
+		},
+		"ReplacedSourceDoesNotConflict": {
+			reason: "A removed source's lock entry must not block the source replacing it; it is reconciled away.",
+			passes: []pass{
+				{sources: []*mockSource{echoSource("xpkg://old", "h1", map[string]string{"s3.json": "OLD"})}},
+				{sources: []*mockSource{echoSource("xpkg://new", "h1", map[string]string{"s3.json": "NEW"})}},
+			},
+			want: map[string]string{"echo/s3.json": "NEW"},
+		},
+		"SourcesBumpedTogetherDoNotConflict": {
+			reason: "Two sources whose shared model changes in the same pass must not conflict with each other's stale entries.",
+			passes: []pass{
+				{sources: []*mockSource{
+					echoSource("xpkg://a", "h1", map[string]string{"shared.json": "V1"}),
+					echoSource("xpkg://b", "h1", map[string]string{"shared.json": "V1"}),
+				}},
+				{sources: []*mockSource{
+					echoSource("xpkg://a", "h2", map[string]string{"shared.json": "V2"}),
+					echoSource("xpkg://b", "h2", map[string]string{"shared.json": "V2"}),
+				}},
+			},
+			want: map[string]string{"echo/shared.json": "V2"},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			memFS := afero.NewMemMapFs()
+			for i, p := range tc.passes {
+				m := New(memFS, []generator.Interface{echoGenerator{}}, nil)
+				var err error
+				live := make([]Source, 0, len(p.sources))
+				for _, src := range p.sources {
+					live = append(live, src)
+					if err = m.Add(t.Context(), src); err != nil {
+						break
+					}
+				}
+				if err == nil {
+					_, err = m.Reconcile(t.Context(), live)
+				}
+				if p.errMsg == "" {
+					if err != nil {
+						t.Fatalf("%s\npass %d: %v", tc.reason, i, err)
+					}
+					continue
+				}
+				if err == nil || !strings.Contains(err.Error(), p.errMsg) {
+					t.Fatalf("%s\npass %d: want error containing %q, got %v", tc.reason, i, p.errMsg, err)
+				}
+			}
+			if tc.want == nil {
+				return
+			}
+			if diff := cmp.Diff(tc.want, readFiles(t, memFS)); diff != "" {
+				t.Errorf("%s\nfiles: -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestManager_Finalize(t *testing.T) {
+	t.Parallel()
+
+	runGen := func(files map[string]string) *mockRunGenerator {
+		return &mockRunGenerator{lang: "ts", files: files}
+	}
+	dep := func(hash string) *mockSource { return &mockSource{key: "xpkg://dep", hash: hash} }
+	api := func(hash string) *mockSource { return &mockSource{key: "fs://apis", hash: hash} }
+
+	t.Run("MergesAllSources", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		gens := []generator.Interface{runGen(map[string]string{"models/index.txt": "S"})}
+		sources := []Source{dep("h1"), api("h2")}
+
+		m := New(memFS, gens, nil)
+		for _, src := range sources {
+			if err := m.Add(t.Context(), src); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+
+		// The merged root file must describe both sources, not just the one
+		// whose copy landed last.
+		got, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(got), "part0") || !strings.Contains(string(got), "part1") {
+			t.Errorf("merged root file lost a source's part; got %q", got)
+		}
+
+		l, err := New(memFS, nil, nil).getLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, ok := l.Run["ts"]
+		if !ok {
+			t.Fatalf("no run entry for ts in lock %+v", l)
+		}
+		if diff := cmp.Diff(map[string]string{"xpkg://dep": "h1", "fs://apis": "h2"}, entry.Sources); diff != "" {
+			t.Errorf("run entry sources: -want, +got:\n%s", diff)
+		}
+	})
+
+	t.Run("FreshRunIsNoOp", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		sources := []Source{dep("h1"), api("h2")}
+
+		m := New(memFS, []generator.Interface{runGen(map[string]string{"models/index.txt": "MERGED"})}, nil)
+		for _, src := range sources {
+			if err := m.Add(t.Context(), src); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		before, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// A second Finalize with a generator whose output differs must not
+		// regenerate: the run entry is fresh for the same sources.
+		m = New(memFS, []generator.Interface{runGen(map[string]string{"models/index.txt": "CHANGED"})}, nil)
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		after, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Errorf("fresh run entry was regenerated: %q became %q", before, after)
+		}
+	})
+
+	t.Run("ChangedSourceRegenerates", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		gens := []generator.Interface{runGen(map[string]string{"models/index.txt": "S"})}
+
+		m := New(memFS, gens, nil)
+		if err := m.Add(t.Context(), dep("h1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), []Source{dep("h1")}); err != nil {
+			t.Fatal(err)
+		}
+
+		// The source set changes; the run entry is stale and regenerates.
+		sources := []Source{dep("h1"), api("h2")}
+		m = New(memFS, gens, nil)
+		if err := m.Add(t.Context(), api("h2")); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+
+		l, err := New(memFS, nil, nil).getLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if diff := cmp.Diff(map[string]string{"xpkg://dep": "h1", "fs://apis": "h2"}, l.Run["ts"].Sources); diff != "" {
+			t.Errorf("run entry did not regenerate: -want, +got:\n%s", diff)
+		}
+	})
+
+	t.Run("RunFileDriftIsRepaired", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		apiSrc := NewFSSource("apis", afero.NewMemMapFs())
+		gens := []generator.Interface{runGen(map[string]string{"models/index.txt": "S"})}
+		sources := []Source{apiSrc}
+
+		m := New(memFS, gens, nil)
+		if err := m.Add(t.Context(), apiSrc); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		want, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := memFS.Remove("ts/index.txt"); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify recreates a missing run file from the lock, byte-identically,
+		// offline: local sources are at hand and the run entry records them.
+		m = New(memFS, gens, nil)
+		if err := m.Verify(t.Context(), sources, "", nil); err != nil {
+			t.Fatalf("Verify did not recreate the deleted run file: %v", err)
+		}
+		got, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("restored run file differs: want %q, got %q", want, got)
+		}
+
+		// A modified run file is reported by Verify and restored by Generate.
+		if err := afero.WriteFile(memFS, "ts/index.txt", []byte("edited"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m = New(memFS, gens, nil)
+		if err := m.Verify(t.Context(), sources, "", nil); err == nil {
+			t.Fatal("Verify did not report the modified run file")
+		}
+		m = New(memFS, gens, nil)
+		if err := m.Generate(t.Context(), sources, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		got, err = afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("restored run file differs: want %q, got %q", want, got)
+		}
+
+		m = New(memFS, gens, nil)
+		if err := m.Verify(t.Context(), sources, "", nil); err != nil {
+			t.Errorf("Verify failed after repair: %v", err)
+		}
+	})
+
+	t.Run("RunFileOfFetchedSourceIsRepaired", func(t *testing.T) {
+		t.Parallel()
+
+		// Real builds pass only the project's own APIs as local, so repairing
+		// a run file fetches every dependency at its locked pin. This
+		// deadlocked when the fetch path read the lock under lockMu again.
+		memFS := afero.NewMemMapFs()
+		gens := []generator.Interface{runGen(map[string]string{"models/index.txt": "S"})}
+		depSrc, apiSrc := dep("h1"), api("h2")
+		sources := []Source{depSrc, apiSrc}
+
+		m := New(memFS, gens, nil)
+		for _, src := range sources {
+			if err := m.Add(t.Context(), src); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		want, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := memFS.Remove("ts/index.txt"); err != nil {
+			t.Fatal(err)
+		}
+
+		fetched := 0
+		fetch := func(_ context.Context, key string, _ LockedSource) (Source, error) {
+			fetched++
+			if key != depSrc.Key() {
+				return nil, fmt.Errorf("unexpected fetch of %s", key)
+			}
+			return depSrc, nil
+		}
+		done := make(chan error, 1)
+		go func() { done <- New(memFS, gens, nil).Verify(t.Context(), []Source{apiSrc}, "", fetch) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Verify did not recreate the deleted run file: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Verify deadlocked repairing a run file of a fetched source")
+		}
+		if fetched != 1 {
+			t.Errorf("fetched %d sources, want 1", fetched)
+		}
+		got, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("restored run file differs: want %q, got %q", want, got)
+		}
+	})
+
+	t.Run("RemovedRunLanguageIsPruned", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		perSource := &mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}}
+		sources := []Source{api("h2")}
+
+		m := New(memFS, []generator.Interface{perSource, runGen(map[string]string{"models/index.txt": "S"})}, nil)
+		if err := m.Add(t.Context(), sources[0]); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+
+		// The run-level language is dropped from the project. Until the next
+		// update Verify says so; the update removes the run entry and files.
+		m = New(memFS, []generator.Interface{perSource}, nil)
+		if err := m.Verify(t.Context(), sources, "", nil); err == nil || !strings.Contains(err.Error(), "not configured any more") {
+			t.Fatalf("Verify before update: want error about the removed language, got %v", err)
+		}
+		if err := m.Add(t.Context(), sources[0]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Reconcile(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+
+		m = New(memFS, []generator.Interface{perSource}, nil)
+		if err := m.Verify(t.Context(), sources, "", nil); err != nil {
+			t.Errorf("Verify after update: %v", err)
+		}
+		if diff := cmp.Diff(map[string]string{"mock/a.json": "A"}, readFiles(t, memFS)); diff != "" {
+			t.Errorf("files of the removed run-level language were left behind: -want, +got:\n%s", diff)
+		}
+		l, err := m.getLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l.Run != nil {
+			t.Errorf("run entry of the removed language was kept: %+v", l.Run)
+		}
+	})
+
+	t.Run("NoRunLevelGeneratorIsNoOp", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		m := New(memFS, []generator.Interface{&mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}}}, nil)
+		if err := m.Add(t.Context(), dep("h1")); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), []Source{dep("h1")}); err != nil {
+			t.Fatal(err)
+		}
+
+		l, err := New(memFS, nil, nil).getLock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if l.Run != nil {
+			t.Errorf("run entries written without a run-level generator: %+v", l.Run)
+		}
+	})
+}
+
+// fingerprintGenerator is a mockGenerator with a configurable fingerprint that
+// counts its runs.
+type fingerprintGenerator struct {
+	mockGenerator
+	fingerprint string
+	runs        *atomic.Int32
+}
+
+func (g *fingerprintGenerator) Fingerprint() string { return g.fingerprint }
+
+func (g *fingerprintGenerator) GenerateFromCRD(ctx context.Context, from afero.Fs, r runner.SchemaRunner) (afero.Fs, error) {
+	g.runs.Add(1)
+	return g.mockGenerator.GenerateFromCRD(ctx, from, r)
+}
+
+func TestManager_FingerprintIsPerSource(t *testing.T) {
+	t.Parallel()
+
+	memFS := afero.NewMemMapFs()
+	var runs atomic.Int32
+	gen := func(fingerprint string) []generator.Interface {
+		return []generator.Interface{&fingerprintGenerator{
+			mockGenerator: mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}},
+			fingerprint:   fingerprint,
+			runs:          &runs,
+		}}
+	}
+	a := &mockSource{key: "xpkg://a", hash: "h1"}
+	b := &mockSource{key: "xpkg://b", hash: "h1"}
+
+	m := New(memFS, gen("v1"), nil)
+	for _, src := range []Source{a, b} {
+		if err := m.Add(t.Context(), src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The generator changes, and an update regenerates only a before it
+	// fails. b's files were still made under the old fingerprint.
+	m = New(memFS, gen("v2"), nil)
+	if err := m.Add(t.Context(), a); err != nil {
+		t.Fatal(err)
+	}
+	// b's files still describe it, so builds pass, but b is reported stale.
+	if err := New(memFS, gen("v2"), nil).Verify(t.Context(), nil, "", nil); err != nil {
+		t.Errorf("Verify after a partial update: %v", err)
+	}
+	stale, err := New(memFS, gen("v2"), nil).StaleSources()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff([]string{"xpkg://b"}, stale); diff != "" {
+		t.Errorf("StaleSources after a partial update: -want, +got:\n%s", diff)
+	}
+
+	// The next update must regenerate b, not skip it as up to date.
+	runs.Store(0)
+	m = New(memFS, gen("v2"), nil)
+	for _, src := range []Source{a, b} {
+		if err := m.Add(t.Context(), src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("update after a partial update ran the generator %d times, want 1 (for b only)", got)
+	}
+	stale, err = New(memFS, gen("v2"), nil).StaleSources()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("StaleSources after the update: %v", stale)
+	}
+}
+
+// echoRunGenerator is a run-level generator whose part for a source is the
+// source's resources, so parts differ between sources. It counts its runs.
+type echoRunGenerator struct {
+	mockRunGenerator
+	runs *atomic.Int32
+}
+
+func (g *echoRunGenerator) GenerateFromCRD(_ context.Context, from afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	g.runs.Add(1)
+	var content []byte
+	err := afero.Walk(from, ".", func(p string, info fs.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		b, err := afero.ReadFile(from, p)
+		content = append(content, b...)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := afero.NewMemMapFs()
+	return out, afero.WriteFile(out, "models/index.txt", content, 0o600)
+}
+
+func TestManager_FingerprintScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("AddingRunLevelLanguageKeepsSourcesFresh", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		var runs atomic.Int32
+		perSource := &fingerprintGenerator{mockGenerator: mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}}, fingerprint: "p", runs: &runs}
+		src := &mockSource{key: "xpkg://a", hash: "h1"}
+
+		if err := New(memFS, []generator.Interface{perSource}, nil).Add(t.Context(), src); err != nil {
+			t.Fatal(err)
+		}
+		runs.Store(0)
+		m := New(memFS, []generator.Interface{perSource, &mockRunGenerator{lang: "ts", files: map[string]string{"models/index.txt": "S"}}}, nil)
+		if err := m.Add(t.Context(), src); err != nil {
+			t.Fatal(err)
+		}
+		if got := runs.Load(); got != 0 {
+			t.Errorf("adding a run-level language regenerated a per-source entry %d times", got)
+		}
+	})
+
+	t.Run("AddingLanguageKeepsRunFresh", func(t *testing.T) {
+		t.Parallel()
+
+		memFS := afero.NewMemMapFs()
+		var runs atomic.Int32
+		run := &echoRunGenerator{mockRunGenerator: mockRunGenerator{lang: "ts"}, runs: &runs}
+		sources := []Source{echoSource("fs://apis", "h1", map[string]string{"x": "X"})}
+
+		m := New(memFS, []generator.Interface{run}, nil)
+		if err := m.Add(t.Context(), sources[0]); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		runs.Store(0)
+		m = New(memFS, []generator.Interface{run, &mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}}}, nil)
+		if err := m.Add(t.Context(), sources[0]); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+		if got := runs.Load(); got != 0 {
+			t.Errorf("adding a per-source language regenerated the run-level one %d times", got)
+		}
+	})
+}
+
+func TestManager_StaleGeneratorRepair(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		reason  string
+		newGen  map[string]string
+		wantErr string
+	}{
+		"SameOutputIsRepaired": {
+			reason: "A file locked under an old fingerprint is repaired if the new generator still makes it byte-identically.",
+			newGen: map[string]string{"a.json": "A"},
+		},
+		"ChangedOutputNamesTheCause": {
+			reason:  "If the new generator makes the file differently, the error must say the CLI or generator changed.",
+			newGen:  map[string]string{"a.json": "CHANGED"},
+			wantErr: "generated by another CLI version or generator configuration",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			memFS := afero.NewMemMapFs()
+			var runs atomic.Int32
+			src := &mockSource{key: "fs://apis", hash: "h1"}
+			old := &fingerprintGenerator{mockGenerator: mockGenerator{lang: "mock", files: map[string]string{"a.json": "A"}}, fingerprint: "v1", runs: &runs}
+			if err := New(memFS, []generator.Interface{old}, nil).Add(t.Context(), src); err != nil {
+				t.Fatal(err)
+			}
+			if err := memFS.Remove("mock/a.json"); err != nil {
+				t.Fatal(err)
+			}
+
+			upgraded := &fingerprintGenerator{mockGenerator: mockGenerator{lang: "mock", files: tc.newGen}, fingerprint: "v2", runs: &runs}
+			err := New(memFS, []generator.Interface{upgraded}, nil).Verify(t.Context(), []Source{src}, "", nil)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("%s\nVerify: %v", tc.reason, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("%s\nVerify: want error containing %q, got %v", tc.reason, tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestManager_RunPartCache(t *testing.T) {
+	t.Parallel()
+
+	setup := func(t *testing.T) (afero.Fs, afero.Fs, *atomic.Int32, *echoRunGenerator) {
+		t.Helper()
+		var runs atomic.Int32
+		return afero.NewMemMapFs(), afero.NewMemMapFs(), &runs, &echoRunGenerator{mockRunGenerator: mockRunGenerator{lang: "ts"}, runs: &runs}
+	}
+	update := func(t *testing.T, m *Manager, sources []Source) {
+		t.Helper()
+		for _, src := range sources {
+			if err := m.Add(t.Context(), src); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := m.Finalize(t.Context(), sources); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("OnlyChangedSourcesAreRegenerated", func(t *testing.T) {
+		t.Parallel()
+
+		memFS, cacheFS, runs, gen := setup(t)
+		dep := echoSource("xpkg://dep", "h1", map[string]string{"dep": "DEP;"})
+		update(t, New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)), []Source{dep, echoSource("fs://apis", "h1", map[string]string{"api": "API1;"})})
+		if got := runs.Load(); got != 2 {
+			t.Fatalf("cold run generated %d parts, want 2", got)
+		}
+
+		runs.Store(0)
+		update(t, New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)), []Source{dep, echoSource("fs://apis", "h2", map[string]string{"api": "API2;"})})
+		if got := runs.Load(); got != 1 {
+			t.Errorf("after one source changed, generated %d parts, want 1", got)
+		}
+		got, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := "part0\nAPI2;part1\nDEP;"; string(got) != want {
+			t.Errorf("merged run file: want %q, got %q", want, got)
+		}
+	})
+
+	t.Run("RepairUsesCachedPartsOffline", func(t *testing.T) {
+		t.Parallel()
+
+		memFS, cacheFS, runs, gen := setup(t)
+		api := echoSource("fs://apis", "h1", map[string]string{"api": "API;"})
+		update(t, New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)), []Source{echoSource("xpkg://dep", "h1", map[string]string{"dep": "DEP;"}), api})
+		want, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := memFS.Remove("ts/index.txt"); err != nil {
+			t.Fatal(err)
+		}
+
+		runs.Store(0)
+		fetch := func(_ context.Context, key string, _ LockedSource) (Source, error) {
+			return nil, fmt.Errorf("fetched %s although its part is cached", key)
+		}
+		if err := New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)).Verify(t.Context(), []Source{api}, "", fetch); err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if got := runs.Load(); got != 0 {
+			t.Errorf("repair generated %d parts, want 0", got)
+		}
+		got, err := afero.ReadFile(memFS, "ts/index.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("restored run file differs: want %q, got %q", want, got)
+		}
+	})
+
+	t.Run("MergeOrderIsIndependentOfSourceOrder", func(t *testing.T) {
+		t.Parallel()
+
+		// Finalize gets the live sources in resolution order, repair in key
+		// order. Both must merge the same way, or repair can never recreate
+		// the file exactly.
+		memFS, _, _, gen := setup(t)
+		dep := echoSource("xpkg://dep", "h1", map[string]string{"dep": "DEP;"})
+		api := echoSource("fs://apis", "h1", map[string]string{"api": "API;"})
+		update(t, New(memFS, []generator.Interface{gen}, nil), []Source{dep, api})
+		if err := memFS.Remove("ts/index.txt"); err != nil {
+			t.Fatal(err)
+		}
+		fetch := func(context.Context, string, LockedSource) (Source, error) { return dep, nil }
+		if err := New(memFS, []generator.Interface{gen}, nil).Verify(t.Context(), []Source{api}, "", fetch); err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+	})
+
+	t.Run("CorruptEntryIsAMiss", func(t *testing.T) {
+		t.Parallel()
+
+		memFS, cacheFS, runs, gen := setup(t)
+		sources := []Source{echoSource("fs://apis", "h1", map[string]string{"api": "API;"})}
+		update(t, New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)), sources)
+		entries, err := afero.ReadDir(cacheFS, "ts")
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("want one cache entry, got %v (%v)", entries, err)
+		}
+		if err := afero.WriteFile(cacheFS, "ts/"+entries[0].Name(), []byte("not a tarball"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := memFS.Remove("ts/index.txt"); err != nil {
+			t.Fatal(err)
+		}
+
+		runs.Store(0)
+		if err := New(memFS, []generator.Interface{gen}, nil, WithPartCache(cacheFS)).Verify(t.Context(), sources, "", nil); err != nil {
+			t.Fatalf("Verify: %v", err)
+		}
+		if got := runs.Load(); got != 1 {
+			t.Errorf("a corrupt entry must be regenerated; generated %d parts, want 1", got)
+		}
+	})
+}
+
 func TestManager_SetDependenciesHash(t *testing.T) {
 	t.Parallel()
 
@@ -1116,7 +1925,7 @@ func TestManager_SetDependenciesHash(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if diff := cmp.Diff(tc.want.lock, got); diff != "" {
+			if diff := cmp.Diff(tc.want.lock, got, cmpopts.IgnoreFields(lockSource{}, "Generator")); diff != "" {
 				t.Errorf("%s\nSetDependenciesHash(...): -want lock, +got:\n%s", tc.reason, diff)
 			}
 		})
