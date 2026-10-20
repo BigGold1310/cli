@@ -137,7 +137,7 @@ func TestFromResponse(t *testing.T) {
 			}},
 		},
 		"UpdateWithoutChanges": {
-			reason: "An update reporting no field changes changes nothing the user can see, so it should decode as a no-op.",
+			reason: "An update reporting no field changes alters nothing the user can see, so it should decode as a no-op.",
 			args:   args{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}},
 			want: want{plan: &ResourcePlan{
 				APIVersion: "ec2.aws.upbound.io/v1beta1",
