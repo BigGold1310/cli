@@ -53,7 +53,14 @@ func TestPlan(t *testing.T) {
 	}
 
 	t.Run("RequestCarriesAllState", func(t *testing.T) {
-		c := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}}
+		c := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{
+			Action: diffv1alpha1.Action_ACTION_UPDATE,
+			Changes: []*diffv1alpha1.FieldChange{{
+				Field:   "spec.forProvider.cidrBlock",
+				Actual:  value("10.0.0.0/16"),
+				Planned: value("10.1.0.0/16"),
+			}},
+		}}
 
 		got, err := Plan(context.Background(), c, desired, actual, []*structpb.Struct{secret})
 		if err != nil {

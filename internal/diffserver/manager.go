@@ -42,6 +42,7 @@ import (
 
 	pkgmetav1 "github.com/crossplane/crossplane/apis/v2/pkg/meta/v1"
 
+	"github.com/crossplane/cli/v2/internal/async"
 	"github.com/crossplane/cli/v2/internal/containerruntime"
 	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 )
@@ -194,8 +195,10 @@ func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Ma
 // every package that declares the DiffServer capability, in parallel and best
 // effort: an image that cannot serve (no capability, fetch or startup
 // failure) is returned as skipped rather than failing the run, since its
-// resources degrade to the approximate client-side diff.
-func (m *Manager) Start(ctx context.Context, inputs []Input) ([]Skipped, error) {
+// resources degrade to the approximate client-side diff. Progress is reported
+// per image on events (nil means no reporting), with the package pull and the
+// server start as separate steps because the pull dominates a cold start.
+func (m *Manager) Start(ctx context.Context, inputs []Input, events async.EventChannel) ([]Skipped, error) {
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
@@ -205,7 +208,7 @@ func (m *Manager) Start(ctx context.Context, inputs []Input) ([]Skipped, error) 
 		wg.Add(1)
 		go func(in Input) {
 			defer wg.Done()
-			s, skip := m.startOne(ctx, in)
+			s, skip := m.startOne(ctx, in, events)
 			mu.Lock()
 			defer mu.Unlock()
 			if skip != nil {
@@ -243,13 +246,19 @@ func (m *Manager) register(s *Server) {
 	}
 }
 
-func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
+func (m *Manager) startOne(ctx context.Context, in Input, events async.EventChannel) (*Server, *Skipped) {
 	image := in.Image
 
+	// The package pull is its own reported step: on a cold cache it downloads
+	// the full provider package and dwarfs everything that follows.
+	pull := "Pulling provider package " + image
+	events.SendEvent(pull, async.EventStatusStarted)
 	pkg, err := m.pkgs.Get(ctx, image)
 	if err != nil {
+		events.SendEvent(pull, async.EventStatusFailure)
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot fetch package: %s", err)}
 	}
+	events.SendEvent(pull, async.EventStatusSuccess)
 
 	meta := pkg.GetMeta()
 	if meta == nil || !pkgmetav1.CapabilitiesContainFuzzyMatch(meta.GetCapabilities(), CapabilityDiffServer) {
@@ -293,15 +302,23 @@ func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
 		Target:      in.Target,
 		Log:         m.log,
 		Client:      m.cli,
+		// The container reports its own image pull on the same channel, as a
+		// separate step: Docker pulls the image again even when the package
+		// cache is warm, and only when the daemon does not have it yet.
+		Events: events,
 	}
 
+	start := "Starting diff server for " + image
+	events.SendEvent(start, async.EventStatusStarted)
 	running, err := ctr.Start(ctx)
 	if err != nil {
+		events.SendEvent(start, async.EventStatusFailure)
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot start diff server container: %s", err)}
 	}
 
 	server, err := m.connect(ctx, running, image)
 	if err != nil {
+		events.SendEvent(start, async.EventStatusFailure)
 		// An orphaned container is left behind even on failure, for debugging.
 		if !running.Reused && cleanup != CleanupOrphan {
 			if serr := running.Stop(ctx, CleanupRemove); serr != nil {
@@ -310,6 +327,7 @@ func (m *Manager) startOne(ctx context.Context, in Input) (*Server, *Skipped) {
 		}
 		return nil, &Skipped{Image: image, Reason: err.Error()}
 	}
+	events.SendEvent(start, async.EventStatusSuccess)
 
 	server.GroupKinds = gks
 	server.cleanup = cleanup

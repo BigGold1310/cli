@@ -267,7 +267,7 @@ func TestManagerStart(t *testing.T) {
 		fd := newFakeDocker("", nil)
 		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
-		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-s3:v2.9.0"}))
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-s3:v2.9.0"}), nil)
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
@@ -283,7 +283,7 @@ func TestManagerStart(t *testing.T) {
 		fd := newFakeDocker(servePlanService(t), nil)
 		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
-		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}), nil)
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
@@ -322,7 +322,7 @@ func TestManagerStart(t *testing.T) {
 		})
 		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
-		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}), nil)
 		if err != nil || len(skipped) != 0 {
 			t.Fatalf("Start(...): unexpected error or skips: %v %+v", err, skipped)
 		}
@@ -335,7 +335,7 @@ func TestManagerStart(t *testing.T) {
 		fd := newFakeDocker(servePlanService(t), nil)
 		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
 
-		if _, err := m.Start(ctx, []Input{{Image: "xpkg.example.org/provider-aws-ec2:v2.9.0", Cleanup: CleanupOrphan}}); err != nil {
+		if _, err := m.Start(ctx, []Input{{Image: "xpkg.example.org/provider-aws-ec2:v2.9.0", Cleanup: CleanupOrphan}}, nil); err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}
 		if err := m.Stop(ctx); err != nil {
@@ -357,7 +357,7 @@ func TestManagerStart(t *testing.T) {
 		fd := newFakeDocker(lis.Addr().String(), nil)
 		m := NewManager(pkgs, log, WithDockerClient(fd.client()), WithReadyTimeout(700*time.Millisecond))
 
-		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}))
+		skipped, err := m.Start(ctx, Images([]string{"xpkg.example.org/provider-aws-ec2:v2.9.0"}), nil)
 		if err != nil {
 			t.Fatalf("Start(...): unexpected error: %v", err)
 		}

@@ -35,6 +35,8 @@ import (
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
+
+	"github.com/crossplane/cli/v2/internal/async"
 )
 
 // A Container runs one package image as a local Docker container serving a
@@ -94,6 +96,11 @@ type Container struct {
 	// fake to exercise container lifecycle and cleanup handling without a
 	// real Docker daemon.
 	Client Client
+
+	// Events receives progress events for the container's long-running steps,
+	// today only the image pull, which happens exactly when the daemon does
+	// not already have the image. Nil means no events are sent.
+	Events async.EventChannel
 }
 
 // Client is the subset of the Docker client a Container uses to pull its
@@ -279,9 +286,8 @@ func (c *Container) create(ctx context.Context, cli Client) (string, error) {
 	if c.PullPolicy == PullAlways {
 		c.Log.Debug("Pulling image with pullPolicy: Always", "image", c.Image)
 
-		err = PullImage(ctx, cli, c.Image, options)
-		if err != nil {
-			return "", errors.Wrapf(err, "cannot pull Docker image %q", c.Image)
+		if err := c.pullImage(ctx, cli, options); err != nil {
+			return "", err
 		}
 	}
 
@@ -315,9 +321,8 @@ func (c *Container) create(ctx context.Context, cli Client) (string, error) {
 		// The image was not found, but we're allowed to pull it.
 		c.Log.Debug("Image not found, pulling", "image", c.Image)
 
-		err = PullImage(ctx, cli, c.Image, options)
-		if err != nil {
-			return "", errors.Wrapf(err, "cannot pull Docker image %q", c.Image)
+		if err := c.pullImage(ctx, cli, options); err != nil {
+			return "", err
 		}
 
 		rsp, err = cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -335,6 +340,21 @@ func (c *Container) create(ctx context.Context, cli Client) (string, error) {
 	}
 
 	return rsp.ID, nil
+}
+
+// pullImage pulls the container's image, reporting the pull on the Events
+// channel so callers can show it as its own step: it is the dominant cost of
+// a cold start, and it only happens at all when the daemon does not have the
+// image yet.
+func (c *Container) pullImage(ctx context.Context, cli Client, options client.ImagePullOptions) error {
+	desc := "Pulling image " + c.Image
+	c.Events.SendEvent(desc, async.EventStatusStarted)
+	if err := PullImage(ctx, cli, c.Image, options); err != nil {
+		c.Events.SendEvent(desc, async.EventStatusFailure)
+		return errors.Wrapf(err, "cannot pull Docker image %q", c.Image)
+	}
+	c.Events.SendEvent(desc, async.EventStatusSuccess)
+	return nil
 }
 
 // start ensures the container is running and returns its address.

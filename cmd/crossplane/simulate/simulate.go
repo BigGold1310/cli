@@ -52,6 +52,7 @@ import (
 	pkgv1beta1 "github.com/crossplane/crossplane/apis/v2/pkg/v1beta1"
 
 	"github.com/crossplane/cli/v2/cmd/crossplane/common/load"
+	"github.com/crossplane/cli/v2/internal/async"
 	"github.com/crossplane/cli/v2/internal/containerruntime"
 	"github.com/crossplane/cli/v2/internal/diffserver"
 	"github.com/crossplane/cli/v2/internal/docker"
@@ -182,9 +183,9 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 
 	mgr := diffserver.NewManager(pkgClient, logger, diffserver.WithSessionID(c.SessionID))
 	var skipped []diffserver.Skipped
-	if err := sp.WrapWithSuccessSpinner("Starting provider diff servers", func() error {
+	if err := sp.WrapAsyncWithSuccessSpinners(func(ch async.EventChannel) error {
 		var err error
-		skipped, err = mgr.Start(ctx, inputs)
+		skipped, err = mgr.Start(ctx, inputs, ch)
 		return err
 	}); err != nil {
 		return errors.Wrap(err, "cannot start diff servers")
@@ -448,24 +449,9 @@ func (c *objectStoreCache) gather(ctx context.Context, kubeClient client.Client,
 		}
 	}
 
-	// The ProviderConfig's group relates to the resource's group, but not
-	// uniformly: most providers serve it one level up (s3.aws.upbound.io →
-	// aws.upbound.io), others in the resource's own group
-	// (kubernetes.crossplane.io). Probe from the resource's group toward the
-	// root and take the first group that serves the kind.
-	group := desired.GroupVersionKind().Group
-	var mapping *meta.RESTMapping
-	for {
-		m, err := rmapper.RESTMapping(schema.GroupKind{Group: group, Kind: kind})
-		if err == nil {
-			mapping = m
-			break
-		}
-		i := strings.Index(group, ".")
-		if i < 0 {
-			return nil
-		}
-		group = group[i+1:]
+	mapping := providerConfigMapping(rmapper, desired.GroupVersionKind().Group, kind)
+	if mapping == nil {
+		return nil
 	}
 
 	key := client.ObjectKey{Name: name}
@@ -491,6 +477,27 @@ func (c *objectStoreCache) gather(ctx context.Context, kubeClient client.Client,
 	}
 	c.cache[ck] = store
 	return store
+}
+
+// providerConfigMapping returns the REST mapping for the ProviderConfig kind
+// the given resource group's provider serves, or nil when no group serves it.
+//
+// The ProviderConfig's group relates to the resource's group, but not
+// uniformly: most providers serve it one level up (s3.aws.upbound.io →
+// aws.upbound.io), others in the resource's own group
+// (kubernetes.crossplane.io). Probe from the resource's group toward the root
+// and take the first group that serves the kind.
+func providerConfigMapping(rmapper meta.RESTMapper, group, kind string) *meta.RESTMapping {
+	for {
+		if m, err := rmapper.RESTMapping(schema.GroupKind{Group: group, Kind: kind}); err == nil {
+			return m
+		}
+		i := strings.Index(group, ".")
+		if i < 0 {
+			return nil
+		}
+		group = group[i+1:]
+	}
 }
 
 // relevantProviderImages returns the package images of exactly the providers

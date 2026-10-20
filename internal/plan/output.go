@@ -214,6 +214,11 @@ func symbol(p *ResourcePlan) string {
 func renderChangeTree(w io.Writer, changes []FieldChange) {
 	var prev []string
 	for _, c := range sortedChanges(changes) {
+		if c.Actual == nil && c.Planned == nil {
+			// No value on either side renders no leaf line, so printing its
+			// parent keys would leave them dangling with nothing beneath.
+			continue
+		}
 		segs := strings.Split(c.Path, ".")
 		if len(segs) == 0 {
 			continue

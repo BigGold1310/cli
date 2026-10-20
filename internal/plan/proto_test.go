@@ -136,6 +136,42 @@ func TestFromResponse(t *testing.T) {
 				},
 			}},
 		},
+		"UpdateWithoutChanges": {
+			reason: "An update reporting no field changes changes nothing the user can see, so it should decode as a no-op.",
+			args:   args{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}},
+			want: want{plan: &ResourcePlan{
+				APIVersion: "ec2.aws.upbound.io/v1beta1",
+				Kind:       "VPC",
+				Name:       "my-vpc",
+				Action:     ActionNoOp,
+			}},
+		},
+		"UpdateWithValuelessChanges": {
+			reason: "An update whose changes all carry no value on either side should decode as a no-op, keeping the changes.",
+			args: args{rsp: &diffv1alpha1.PlanResponse{
+				Action: diffv1alpha1.Action_ACTION_UPDATE,
+				Changes: []*diffv1alpha1.FieldChange{{
+					Field: "spec.forProvider.cidrBlock",
+				}},
+			}},
+			want: want{plan: &ResourcePlan{
+				APIVersion: "ec2.aws.upbound.io/v1beta1",
+				Kind:       "VPC",
+				Name:       "my-vpc",
+				Action:     ActionNoOp,
+				Changes:    []FieldChange{{Path: "spec.forProvider.cidrBlock"}},
+			}},
+		},
+		"ReplaceWithoutChanges": {
+			reason: "A replace reporting no field changes still warns about a forced replacement, so it should stay a replace.",
+			args:   args{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_REPLACE}},
+			want: want{plan: &ResourcePlan{
+				APIVersion: "ec2.aws.upbound.io/v1beta1",
+				Kind:       "VPC",
+				Name:       "my-vpc",
+				Action:     ActionReplace,
+			}},
+		},
 		"NoOp": {
 			reason: "A no-op should decode with no changes.",
 			args:   args{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_NO_OP}},

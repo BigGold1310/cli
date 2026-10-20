@@ -66,7 +66,29 @@ func FromResponse(desired *unstructured.Unstructured, rsp *diffv1alpha1.PlanResp
 		}
 	}
 
+	// A diff server can answer update while reporting no field changes: the
+	// Terraform diff the action is decided on can consist entirely of flatmap
+	// count keys ("tags.%", "serviceEndpoints.#"), which carry a collection's
+	// size rather than a field and are never reported as changes. An update
+	// that changes no field is a no-op to the user, so report it as one. A
+	// replace is left alone: it warns about a forced replacement even when the
+	// field that forces it is not reported.
+	if p.Action == ActionUpdate && !hasVisibleChange(p.Changes) {
+		p.Action = ActionNoOp
+	}
+
 	return p, nil
+}
+
+// hasVisibleChange reports whether any change carries a value on either side.
+// A change with neither has nothing to say about the field it names.
+func hasVisibleChange(changes []FieldChange) bool {
+	for _, c := range changes {
+		if c.Actual != nil || c.Planned != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func fromFieldValue(fv *diffv1alpha1.FieldValue) *Value {

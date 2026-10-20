@@ -48,6 +48,9 @@ func testPlans() []*ResourcePlan {
 		{
 			APIVersion: "kms.aws.upbound.io/v1beta1", Kind: "Key", Name: "my-key",
 			Action: ActionNoOp,
+			// A change with no value on either side renders nothing, not even
+			// its parent keys.
+			Changes: []FieldChange{{Path: "spec.forProvider.tags.cost-center"}},
 		},
 		{
 			APIVersion: "s3.aws.upbound.io/v1beta2", Kind: "Bucket", Name: "my-bucket",

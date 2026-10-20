@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +48,10 @@ import (
 )
 
 var vpcGVK = schema.GroupVersionKind{Group: "ec2.aws.upbound.io", Version: "v1beta1", Kind: "VPC"}
+
+func fieldValue(v string) *diffv1alpha1.FieldValue {
+	return &diffv1alpha1.FieldValue{Kind: &diffv1alpha1.FieldValue_Value{Value: structpb.NewStringValue(v)}}
+}
 
 func vpc(name, cidr string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
@@ -177,7 +182,14 @@ func TestSimulateOne(t *testing.T) {
 	t.Run("RoutedUpdate", func(t *testing.T) {
 		live := vpc("my-vpc", "10.0.0.0/16")
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
-		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_UPDATE}}
+		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{
+			Action: diffv1alpha1.Action_ACTION_UPDATE,
+			Changes: []*diffv1alpha1.FieldChange{{
+				Field:   "spec.forProvider.cidrBlock",
+				Actual:  fieldValue("10.0.0.0/16"),
+				Planned: fieldValue("10.1.0.0/16"),
+			}},
+		}}
 
 		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
 
