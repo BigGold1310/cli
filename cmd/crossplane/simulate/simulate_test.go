@@ -191,7 +191,7 @@ func TestSimulateOne(t *testing.T) {
 			}},
 		}}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if got.Action != plan.ActionUpdate || got.Approximate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a provider-computed update, got %+v", got)
@@ -205,7 +205,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).Build()
 		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("new-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), newCRDDefaults(), vpc("new-vpc", "10.0.0.0/16"))
 
 		if got.Action != plan.ActionCreate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a create, got %+v", got)
@@ -219,7 +219,7 @@ func TestSimulateOne(t *testing.T) {
 		live := vpc("my-vpc", "10.0.0.0/16")
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if !got.Approximate || got.Action != plan.ActionUpdate {
 			t.Errorf("simulateOne(...): want an approximate update fallback, got %+v", got)
@@ -231,10 +231,89 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).WithObjects(live).Build()
 		pc := &fakePlanClient{err: notSupportedErr(t)}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if !got.Approximate || got.Action != plan.ActionUpdate {
 			t.Errorf("simulateOne(...): want an approximate fallback on DIFF_COMPUTATION_NOT_SUPPORTED, got %+v", got)
+		}
+	})
+
+	t.Run("FallbackAppliesCRDDefaults", func(t *testing.T) {
+		// The live resource carries fields the API server defaulted on
+		// admission (deletionPolicy, managementPolicies) that the manifest
+		// omits. Applying the manifest would default them right back, so the
+		// fallback must not plan them as removals.
+		crdGVK := schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}
+
+		defScheme := runtime.NewScheme()
+		defScheme.AddKnownTypeWithName(vpcGVK, &unstructured.Unstructured{})
+		defScheme.AddKnownTypeWithName(vpcGVK.GroupVersion().WithKind("VPCList"), &unstructured.UnstructuredList{})
+		defScheme.AddKnownTypeWithName(crdGVK, &unstructured.Unstructured{})
+		defScheme.AddKnownTypeWithName(crdGVK.GroupVersion().WithKind("CustomResourceDefinitionList"), &unstructured.UnstructuredList{})
+
+		crd := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": "apiextensions.k8s.io/v1",
+			"kind":       "CustomResourceDefinition",
+			"metadata":   map[string]any{"name": "vpcs.ec2.aws.upbound.io"},
+			"spec": map[string]any{
+				"group": "ec2.aws.upbound.io",
+				"names": map[string]any{"kind": "VPC", "listKind": "VPCList", "plural": "vpcs", "singular": "vpc"},
+				"scope": "Cluster",
+				"versions": []any{map[string]any{
+					"name":   "v1beta1",
+					"served": true, "storage": true,
+					"schema": map[string]any{"openAPIV3Schema": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"spec": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"deletionPolicy":     map[string]any{"type": "string", "default": "Delete"},
+									"managementPolicies": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "default": []any{"*"}},
+									"forProvider":        map[string]any{"type": "object", "properties": map[string]any{"cidrBlock": map[string]any{"type": "string"}}},
+								},
+							},
+						},
+					}},
+				}},
+			},
+		}}
+
+		live := vpc("my-vpc", "10.0.0.0/16")
+		_ = unstructured.SetNestedField(live.Object, "Delete", "spec", "deletionPolicy")
+		_ = unstructured.SetNestedStringSlice(live.Object, []string{"*"}, "spec", "managementPolicies")
+
+		crdGets := 0
+		kube := fake.NewClientBuilder().WithScheme(defScheme).WithObjects(live, crd).
+			WithInterceptorFuncs(interceptor.Funcs{Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if obj.GetObjectKind().GroupVersionKind().Kind == "CustomResourceDefinition" {
+					crdGets++
+				}
+				return c.Get(ctx, key, obj, opts...)
+			}}).Build()
+
+		crds := newCRDDefaults()
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, newObjectStoreCache(), crds, vpc("my-vpc", "10.1.0.0/16"))
+
+		if !got.Approximate || got.Action != plan.ActionUpdate {
+			t.Fatalf("simulateOne(...): want an approximate update fallback, got %+v", got)
+		}
+		want := []plan.FieldChange{{
+			Path:    "spec.forProvider.cidrBlock",
+			Actual:  &plan.Value{Value: "10.0.0.0/16"},
+			Planned: &plan.Value{Value: "10.1.0.0/16"},
+		}}
+		if diff := cmp.Diff(want, got.Changes); diff != "" {
+			t.Errorf("simulateOne(...): want only the real change, no removals of defaulted fields, -want, +got:\n%s", diff)
+		}
+
+		// An identical manifest plans as a no-op, and the CRD is served from
+		// the cache rather than fetched again.
+		if again := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{}, newObjectStoreCache(), crds, vpc("my-vpc", "10.0.0.0/16")); again.Action != plan.ActionNoOp {
+			t.Errorf("simulateOne(...): want a no-op for a manifest omitting only defaulted fields, got %+v", again)
+		}
+		if crdGets != 1 {
+			t.Errorf("simulateOne(...): want 1 CRD fetch for 2 resources of the same kind, got %d", crdGets)
 		}
 	})
 
@@ -242,7 +321,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(s).Build()
 		pc := &fakePlanClient{err: status.Error(codes.Internal, "boom")}
 
-		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.1.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, rm, "default", &fakeRouter{client: pc}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.1.0.0/16"))
 
 		if got.Error == "" {
 			t.Errorf("simulateOne(...): want a per-resource error, got %+v", got)
@@ -283,7 +362,7 @@ func TestSimulateOne(t *testing.T) {
 		kube := fake.NewClientBuilder().WithScheme(seedScheme).WithObjects(pc, secret).Build()
 		pc2 := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, seedRM, "default", &fakeRouter{client: pc2}, newObjectStoreCache(), vpc("my-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, seedRM, "default", &fakeRouter{client: pc2}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.0.0.0/16"))
 
 		if got.Error != "" {
 			t.Fatalf("simulateOne(...): unexpected error: %s", got.Error)
@@ -411,7 +490,7 @@ func TestSimulateOne(t *testing.T) {
 		emptyRM := meta.NewDefaultRESTMapper(nil)
 		pc := &fakePlanClient{rsp: &diffv1alpha1.PlanResponse{Action: diffv1alpha1.Action_ACTION_CREATE}}
 
-		got := cmd.simulateOne(ctx, kube, emptyRM, "default", &fakeRouter{client: pc}, newObjectStoreCache(), vpc("my-vpc", "10.0.0.0/16"))
+		got := cmd.simulateOne(ctx, kube, emptyRM, "default", &fakeRouter{client: pc}, newObjectStoreCache(), newCRDDefaults(), vpc("my-vpc", "10.0.0.0/16"))
 
 		if got.Action != plan.ActionCreate || got.Error != "" {
 			t.Errorf("simulateOne(...): want a create for an unserved kind, got %+v", got)
