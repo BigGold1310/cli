@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -33,10 +34,20 @@ func mr(spec map[string]any) *unstructured.Unstructured {
 	}}
 }
 
+func managedBy(manager string, op metav1.ManagedFieldsOperationType, fields string) metav1.ManagedFieldsEntry {
+	return metav1.ManagedFieldsEntry{
+		Manager:    manager,
+		Operation:  op,
+		FieldsType: "FieldsV1",
+		FieldsV1:   &metav1.FieldsV1{Raw: []byte(fields)},
+	}
+}
+
 func TestFallback(t *testing.T) {
 	type args struct {
-		desired *unstructured.Unstructured
-		live    *unstructured.Unstructured
+		desired       *unstructured.Unstructured
+		live          *unstructured.Unstructured
+		managedFields []metav1.ManagedFieldsEntry
 	}
 	type want struct {
 		action  Action
@@ -149,6 +160,85 @@ func TestFallback(t *testing.T) {
 				}},
 			},
 		},
+		"LateInitializedFieldsAreNotRemovals": {
+			reason: "Live-only fields owned by the provider (late-initialized) or by nobody (API server defaults) survive an apply and must not plan as removals.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}}),
+				live: mr(map[string]any{
+					"forProvider":    map[string]any{"cidrBlock": "10.0.0.0/16", "instanceTenancy": "default"},
+					"deletionPolicy": "Delete",
+				}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("composed", metav1.ManagedFieldsOperationApply, `{"f:spec":{"f:forProvider":{"f:cidrBlock":{}}}}`),
+					managedBy("provider", metav1.ManagedFieldsOperationUpdate, `{"f:spec":{"f:forProvider":{"f:instanceTenancy":{}}}}`),
+				},
+			},
+			want: want{action: ActionNoOp},
+		},
+		"CoOwnedFieldsAreNotRemovals": {
+			reason: "A field the applier and another manager both own survives the apply - Kubernetes retains it while any owner remains - so omitting it is not a removal.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}}),
+				live: mr(map[string]any{"forProvider": map[string]any{
+					"cidrBlock":       "10.0.0.0/16",
+					"instanceTenancy": "default",
+				}}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("composed", metav1.ManagedFieldsOperationApply, `{"f:spec":{"f:forProvider":{"f:cidrBlock":{},"f:instanceTenancy":{}}}}`),
+					managedBy("provider", metav1.ManagedFieldsOperationUpdate, `{"f:spec":{"f:forProvider":{"f:instanceTenancy":{}}}}`),
+				},
+			},
+			want: want{action: ActionNoOp},
+		},
+		"ApplierOwnedFieldsAreRemovals": {
+			reason: "A live-only field the applier owns really is removed when the manifest omits it.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}}),
+				live: mr(map[string]any{"forProvider": map[string]any{
+					"cidrBlock":          "10.0.0.0/16",
+					"enableDnsHostnames": true,
+				}}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("composed", metav1.ManagedFieldsOperationApply, `{"f:spec":{"f:forProvider":{"f:cidrBlock":{},"f:enableDnsHostnames":{}}}}`),
+				},
+			},
+			want: want{
+				action:  ActionUpdate,
+				changes: []FieldChange{{Path: "spec.forProvider.enableDnsHostnames", Actual: &Value{Value: true}}},
+			},
+		},
+		"ClientSideApplyCountsAsApplier": {
+			reason: "kubectl's client-side apply records operation Update, but its fields are declarative intent and their removal is real.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{}}),
+				live:    mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("kubectl-client-side-apply", metav1.ManagedFieldsOperationUpdate, `{"f:spec":{"f:forProvider":{"f:cidrBlock":{}}}}`),
+				},
+			},
+			want: want{
+				action:  ActionUpdate,
+				changes: []FieldChange{{Path: "spec.forProvider.cidrBlock", Actual: &Value{Value: "10.0.0.0/16"}}},
+			},
+		},
+		"AtomicListOwnershipCoversElements": {
+			reason: "FieldsV1 owns atomic lists as a whole, so element removals below an applier-owned list are real, and ones below a provider-owned list are not.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{}}),
+				live: mr(map[string]any{
+					"forProvider":        map[string]any{"securityGroupIds": []any{"sg-1"}},
+					"managementPolicies": []any{"Observe"},
+				}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("composed", metav1.ManagedFieldsOperationApply, `{"f:spec":{"f:managementPolicies":{}}}`),
+					managedBy("provider", metav1.ManagedFieldsOperationUpdate, `{"f:spec":{"f:forProvider":{"f:securityGroupIds":{}}}}`),
+				},
+			},
+			want: want{
+				action:  ActionUpdate,
+				changes: []FieldChange{{Path: "spec.managementPolicies[0]", Actual: &Value{Value: "Observe"}}},
+			},
+		},
 		"ListLengthChange": {
 			reason: "Lists of different lengths diff as one whole-list change.",
 			args: args{
@@ -168,6 +258,10 @@ func TestFallback(t *testing.T) {
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			if len(tc.args.managedFields) > 0 {
+				tc.args.live.SetManagedFields(tc.args.managedFields)
+			}
+
 			got := Fallback(tc.args.desired, tc.args.live, "test")
 
 			if !got.Approximate {

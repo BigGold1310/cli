@@ -230,8 +230,9 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 
 	plans := make([]*plan.ResourcePlan, 0, len(resources))
 	stores := newObjectStoreCache()
+	crds := newCRDDefaults()
 	for _, desired := range resources {
-		plans = append(plans, c.simulateOne(ctx, kubeClient, rmapper, defaultNamespace, mgr, stores, desired))
+		plans = append(plans, c.simulateOne(ctx, kubeClient, rmapper, defaultNamespace, mgr, stores, crds, desired))
 	}
 
 	return renderer.Render(k.Stdout, plans)
@@ -425,7 +426,7 @@ type router interface {
 // to a diff server, and fall back to the approximate client-side diff when no
 // server can plan it. Failures become per-resource errors so one resource
 // never fails the whole run.
-func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, mgr router, stores *objectStoreCache, desired *unstructured.Unstructured) *plan.ResourcePlan {
+func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper meta.RESTMapper, defaultNamespace string, mgr router, stores *objectStoreCache, crds *crdDefaults, desired *unstructured.Unstructured) *plan.ResourcePlan {
 	if desired.GetName() == "" {
 		p := plan.NewResourcePlan(desired)
 		p.Error = "resource has no name"
@@ -447,7 +448,11 @@ func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper
 	gk := desired.GroupVersionKind().GroupKind()
 	planClient, ok := mgr.Route(gk)
 	if !ok {
-		return plan.Fallback(desired, live, fmt.Sprintf("no diff server for %s", gk))
+		// The fallback diffs desired against live verbatim, but live was
+		// defaulted by the API server on admission and applying the manifest
+		// would default it again. Apply the CRD's defaults to desired first,
+		// so defaulted fields the manifest omits do not plan as removals.
+		return plan.Fallback(crds.apply(ctx, kubeClient, rmapper, desired), live, fmt.Sprintf("no diff server for %s", gk))
 	}
 
 	pctx, cancel := context.WithTimeout(ctx, c.Timeout)
@@ -458,7 +463,7 @@ func (c *Cmd) simulateOne(ctx context.Context, kubeClient client.Client, rmapper
 	p, err := plan.Plan(pctx, planClient, desired, live, store)
 	if err != nil {
 		if plan.IsNotSupported(err) {
-			return plan.Fallback(desired, live, "the provider cannot compute a diff for this resource")
+			return plan.Fallback(crds.apply(ctx, kubeClient, rmapper, desired), live, "the provider cannot compute a diff for this resource")
 		}
 		p := plan.NewResourcePlan(desired)
 		p.Error = fmt.Sprintf("diff server cannot plan: %s", err)
