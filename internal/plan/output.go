@@ -269,17 +269,23 @@ func renderSummary(w io.Writer, plans []*ResourcePlan) {
 	_, _ = fmt.Fprintln(w, line+".")
 
 	if s.Replace > 0 {
-		fields := replaceFields(plans)
+		named := 0
+		for _, p := range plans {
+			if p.Error == "" && p.Action == ActionReplace && len(p.ReplacePaths) > 0 {
+				named++
+			}
+		}
 		_, _ = fmt.Fprintln(w)
-		if len(fields) > 0 {
-			_, _ = fmt.Fprintf(w, "Warning: %s force replacement: %s.\n", pluralize(s.Replace, "resource has fields that", "resources have fields that"), strings.Join(fields, ", "))
-		} else {
+		if named > 0 {
+			_, _ = fmt.Fprintf(w, "Warning: %s force replacement: %s.\n", pluralize(named, "resource has fields that", "resources have fields that"), strings.Join(replaceFields(plans), ", "))
+		}
+		if unnamed := s.Replace - named; unnamed > 0 {
 			// The provider decided on a replacement without flagging any
 			// reported change as the cause. That happens when the forcing
 			// change is one its plan does not report as a field: a collection
 			// growing or shrinking, or a parameter behind an unresolved
 			// Secret reference.
-			_, _ = fmt.Fprintf(w, "Warning: %s replacement, but the provider did not report which field forces it.\n", pluralize(s.Replace, "resource requires", "resources require"))
+			_, _ = fmt.Fprintf(w, "Warning: %s replacement, but the provider did not report which field forces it.\n", pluralize(unnamed, "resource requires", "resources require"))
 		}
 		_, _ = fmt.Fprintln(w, "Crossplane providers never destroy and recreate to apply a change.")
 		_, _ = fmt.Fprintln(w, "Applying this leaves the resource unsynced until it is replaced manually.")

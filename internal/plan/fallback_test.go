@@ -175,6 +175,21 @@ func TestFallback(t *testing.T) {
 			},
 			want: want{action: ActionNoOp},
 		},
+		"CoOwnedFieldsAreNotRemovals": {
+			reason: "A field the applier and another manager both own survives the apply - Kubernetes retains it while any owner remains - so omitting it is not a removal.",
+			args: args{
+				desired: mr(map[string]any{"forProvider": map[string]any{"cidrBlock": "10.0.0.0/16"}}),
+				live: mr(map[string]any{"forProvider": map[string]any{
+					"cidrBlock":       "10.0.0.0/16",
+					"instanceTenancy": "default",
+				}}),
+				managedFields: []metav1.ManagedFieldsEntry{
+					managedBy("composed", metav1.ManagedFieldsOperationApply, `{"f:spec":{"f:forProvider":{"f:cidrBlock":{},"f:instanceTenancy":{}}}}`),
+					managedBy("provider", metav1.ManagedFieldsOperationUpdate, `{"f:spec":{"f:forProvider":{"f:instanceTenancy":{}}}}`),
+				},
+			},
+			want: want{action: ActionNoOp},
+		},
 		"ApplierOwnedFieldsAreRemovals": {
 			reason: "A live-only field the applier owns really is removed when the manifest omits it.",
 			args: args{

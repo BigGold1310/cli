@@ -25,12 +25,14 @@ import (
 )
 
 // applierOwned returns the union of live's field sets owned by declarative
-// appliers: server-side apply managers, plus kubectl's client-side apply.
-// Applying a manifest only removes fields its applier owns, so a live-only
-// field outside this set - late-initialized by the provider, or defaulted by
-// the API server and owned by nobody - survives the apply and must not plan
-// as a removal. nil means ownership is unknown (no managedFields, or ones
-// that cannot be parsed) and removals should be taken at face value.
+// appliers - server-side apply managers, plus kubectl's client-side apply -
+// minus the fields other managers own too. Applying a manifest only removes
+// fields its applier owns exclusively: a live-only field outside this set -
+// late-initialized by the provider, defaulted by the API server and owned by
+// nobody, or co-owned by another manager that keeps it alive - survives the
+// apply and must not plan as a removal. nil means ownership is unknown (no
+// managedFields, or ones that cannot be parsed) and removals should be taken
+// at face value.
 func applierOwned(live *unstructured.Unstructured) *fieldpath.Set {
 	if live == nil {
 		return nil
@@ -41,20 +43,22 @@ func applierOwned(live *unstructured.Unstructured) *fieldpath.Set {
 	}
 
 	owned := fieldpath.NewSet()
+	others := fieldpath.NewSet()
 	for _, e := range entries {
 		if e.Subresource != "" || e.FieldsV1 == nil {
-			continue
-		}
-		if e.Operation != metav1.ManagedFieldsOperationApply && e.Manager != "kubectl-client-side-apply" {
 			continue
 		}
 		s := fieldpath.NewSet()
 		if err := s.FromJSON(bytes.NewReader(e.FieldsV1.Raw)); err != nil {
 			return nil
 		}
-		owned = owned.Union(s)
+		if e.Operation == metav1.ManagedFieldsOperationApply || e.Manager == "kubectl-client-side-apply" {
+			owned = owned.Union(s)
+		} else {
+			others = others.Union(s)
+		}
 	}
-	return owned
+	return owned.Difference(others)
 }
 
 // ownedLeaf reports whether leaves - the leaf members of an applier-owned
@@ -63,7 +67,7 @@ func applierOwned(live *unstructured.Unstructured) *fieldpath.Set {
 // FieldsV1 records atomic lists and maps.
 func ownedLeaf(leaves *fieldpath.Set, fp fieldpath.Path) bool {
 	for i := 1; i <= len(fp); i++ {
-		if leaves.Has(fieldpath.Path(fp[:i])) {
+		if leaves.Has(fp[:i]) {
 			return true
 		}
 	}

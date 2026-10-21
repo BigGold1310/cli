@@ -156,7 +156,8 @@ func TestRenderPlanReplaceWithoutReportedCause(t *testing.T) {
 
 Plan: 0 to add, 0 to change, 0 to destroy, 2 require replacement.
 
-Warning: 2 resources have fields that force replacement: kubeletConfig.
+Warning: 1 resource has fields that force replacement: kubeletConfig.
+Warning: 1 resource requires replacement, but the provider did not report which field forces it.
 Crossplane providers never destroy and recreate to apply a change.
 Applying this leaves the resource unsynced until it is replaced manually.
 `
