@@ -214,9 +214,11 @@ func symbol(p *ResourcePlan) string {
 func renderChangeTree(w io.Writer, changes []FieldChange) {
 	var prev []string
 	for _, c := range sortedChanges(changes) {
-		if c.Actual == nil && c.Planned == nil {
+		if c.Actual == nil && c.Planned == nil && !c.RequiresReplace {
 			// No value on either side renders no leaf line, so printing its
-			// parent keys would leave them dangling with nothing beneath.
+			// parent keys would leave them dangling with nothing beneath. A
+			// change that forces replacement is the exception: hiding it would
+			// leave a replace with nothing that explains it.
 			continue
 		}
 		segs := strings.Split(c.Path, ".")
@@ -247,6 +249,8 @@ func renderChangeTree(w io.Writer, changes []FieldChange) {
 			_, _ = fmt.Fprintf(w, "%s+ %s: %s%s\n", indent, leaf, formatValue(c.Planned), note)
 		case c.Actual != nil:
 			_, _ = fmt.Fprintf(w, "%s- %s: %s%s\n", indent, leaf, formatValue(c.Actual), note)
+		default:
+			_, _ = fmt.Fprintf(w, "%s! %s: (value not reported)%s\n", indent, leaf, note)
 		}
 	}
 }
@@ -267,7 +271,16 @@ func renderSummary(w io.Writer, plans []*ResourcePlan) {
 	if s.Replace > 0 {
 		fields := replaceFields(plans)
 		_, _ = fmt.Fprintln(w)
-		_, _ = fmt.Fprintf(w, "Warning: %s force replacement: %s.\n", pluralize(s.Replace, "resource has fields that", "resources have fields that"), strings.Join(fields, ", "))
+		if len(fields) > 0 {
+			_, _ = fmt.Fprintf(w, "Warning: %s force replacement: %s.\n", pluralize(s.Replace, "resource has fields that", "resources have fields that"), strings.Join(fields, ", "))
+		} else {
+			// The provider decided on a replacement without flagging any
+			// reported change as the cause. That happens when the forcing
+			// change is one its plan does not report as a field: a collection
+			// growing or shrinking, or a parameter behind an unresolved
+			// Secret reference.
+			_, _ = fmt.Fprintf(w, "Warning: %s replacement, but the provider did not report which field forces it.\n", pluralize(s.Replace, "resource requires", "resources require"))
+		}
 		_, _ = fmt.Fprintln(w, "Crossplane providers never destroy and recreate to apply a change.")
 		_, _ = fmt.Fprintln(w, "Applying this leaves the resource unsynced until it is replaced manually.")
 	}

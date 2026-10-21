@@ -117,6 +117,71 @@ Warning: 1 resource could not be planned.
 	}
 }
 
+func TestRenderPlanReplaceWithoutReportedCause(t *testing.T) {
+	// A diff server can decide on a replacement without flagging any reported
+	// change as the cause (the forcing change can be a collection size or an
+	// unresolved Secret-backed parameter, which it does not report as fields).
+	// The warning must say so instead of listing nothing. A forcing change
+	// with no value on either side still renders, so the cause is never
+	// silently dropped from the tree.
+	plans := []*ResourcePlan{{
+		APIVersion: "containerservice.azure.upbound.io/v1beta2", Kind: "KubernetesCluster", Name: "my-aks",
+		Action: ActionReplace,
+		Changes: []FieldChange{
+			{Path: "spec.forProvider.windowsProfile.adminPassword", Actual: &Value{Sensitive: true}, Planned: &Value{Unresolved: true}},
+			{Path: "spec.forProvider.defaultNodePool.kubeletConfig", RequiresReplace: true},
+		},
+		ReplacePaths: []string{"spec.forProvider.defaultNodePool.kubeletConfig"},
+	}, {
+		APIVersion: "containerservice.azure.upbound.io/v1beta2", Kind: "KubernetesCluster", Name: "other-aks",
+		Action: ActionReplace,
+		Changes: []FieldChange{
+			{Path: "spec.forProvider.windowsProfile.adminPassword", Actual: &Value{Sensitive: true}, Planned: &Value{Unresolved: true}},
+		},
+	}}
+
+	want := `[-/+] KubernetesCluster.containerservice.azure.upbound.io my-aks (replace)
+    spec:
+      forProvider:
+        defaultNodePool:
+          ! kubeletConfig: (value not reported)  # forces replacement
+        windowsProfile:
+          ~ adminPassword: (sensitive value) -> (unresolved reference)
+
+[-/+] KubernetesCluster.containerservice.azure.upbound.io other-aks (replace)
+    spec:
+      forProvider:
+        windowsProfile:
+          ~ adminPassword: (sensitive value) -> (unresolved reference)
+
+Plan: 0 to add, 0 to change, 0 to destroy, 2 require replacement.
+
+Warning: 2 resources have fields that force replacement: kubeletConfig.
+Crossplane providers never destroy and recreate to apply a change.
+Applying this leaves the resource unsynced until it is replaced manually.
+`
+
+	var buf bytes.Buffer
+	r, _ := NewRenderer(FormatPlan)
+	if err := r.Render(&buf, plans); err != nil {
+		t.Fatalf("Render(plan): unexpected error: %v", err)
+	}
+	if diff := cmp.Diff(want, buf.String()); diff != "" {
+		t.Errorf("Render(plan): -want, +got:\n%s", diff)
+	}
+
+	// With no replace path reported anywhere, the warning says the provider
+	// did not name the forcing field rather than listing an empty set.
+	var buf2 bytes.Buffer
+	if err := r.Render(&buf2, plans[1:]); err != nil {
+		t.Fatalf("Render(plan): unexpected error: %v", err)
+	}
+	wantWarning := "Warning: 1 resource requires replacement, but the provider did not report which field forces it.\n"
+	if !bytes.Contains(buf2.Bytes(), []byte(wantWarning)) {
+		t.Errorf("Render(plan): want output to contain %q, got:\n%s", wantWarning, buf2.String())
+	}
+}
+
 func TestNewRendererUnknownFormat(t *testing.T) {
 	if _, err := NewRenderer("diff"); err == nil {
 		t.Errorf("NewRenderer(diff): want an error for an unsupported format")
