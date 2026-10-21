@@ -69,8 +69,14 @@ import (
 var helpDetail string
 
 // Per-provider runtime annotations on Provider manifests passed via
-// --providers, mirroring render's per-function runtime-docker annotations.
+// --providers, mirroring render's per-function runtime annotations.
 const (
+	// AnnotationKeyRuntime selects how a provider's diff server is run:
+	// Docker (the default) runs the package image as a local container,
+	// Development connects to a diff server already running outside Docker,
+	// for example from source or under a debugger.
+	AnnotationKeyRuntime = "simulate.crossplane.io/runtime"
+
 	// AnnotationKeyDockerPublishAddress sets the address Docker publishes
 	// this provider's diff server port on. Defaults to loopback only.
 	AnnotationKeyDockerPublishAddress = "simulate.crossplane.io/runtime-docker-publish-address"
@@ -84,6 +90,21 @@ const (
 	// tears it down, Orphan leaves it running so later runs reuse it without
 	// paying startup.
 	AnnotationKeyDockerCleanup = "simulate.crossplane.io/runtime-docker-cleanup"
+
+	// AnnotationKeyDevelopmentTarget is the gRPC target of a Development
+	// provider's diff server. Defaults to localhost:9099, upjet's default
+	// for `internal diff-server --address`.
+	AnnotationKeyDevelopmentTarget = "simulate.crossplane.io/runtime-development-target"
+
+	// AnnotationKeyDevelopmentAPIGroups lists, comma-separated, the API
+	// groups a Development provider's diff server serves. No package is
+	// fetched for a Development provider, so nothing else says which
+	// resources route to it. Legacy and namespaced (.m.) groups are distinct
+	// and must both be listed.
+	AnnotationKeyDevelopmentAPIGroups = "simulate.crossplane.io/runtime-development-api-groups"
+
+	// defaultDevelopmentTarget is upjet's default diff server address.
+	defaultDevelopmentTarget = "localhost:9099"
 )
 
 // Cmd previews what applying managed resources would do.
@@ -140,8 +161,19 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 		return err
 	}
 
-	if err := docker.Check(ctx); err != nil {
-		return errors.Wrap(err, "cannot connect to Docker, which simulate needs to run provider diff servers")
+	var inputs []diffserver.Input
+	if c.Providers != "" {
+		if inputs, err = loadProviderInputs(c.Providers); err != nil {
+			return errors.Wrapf(err, "cannot load provider manifests from %q", c.Providers)
+		}
+	}
+	// Only a provider whose package image runs as a container needs Docker;
+	// a Development provider's server is already running. Discovery from the
+	// cluster always yields the former.
+	if c.Providers == "" || needsDocker(inputs) {
+		if err := docker.Check(ctx); err != nil {
+			return errors.Wrap(err, "cannot connect to Docker, which simulate needs to run provider diff servers")
+		}
 	}
 
 	kubeClient, rmapper, defaultNamespace, err := c.setupKubeClient(logger)
@@ -154,12 +186,7 @@ func (c *Cmd) Run(ctx context.Context, k *kong.Context, logger logging.Logger, s
 		return err
 	}
 
-	var inputs []diffserver.Input
-	if c.Providers != "" {
-		if inputs, err = loadProviderInputs(c.Providers); err != nil {
-			return errors.Wrapf(err, "cannot load provider manifests from %q", c.Providers)
-		}
-	} else {
+	if c.Providers == "" {
 		// With local ImageConfigs the rewrites apply to original package
 		// references, so discovery must hand those out; without them the
 		// cluster's resolved reference is the exact artifact it runs.
@@ -243,9 +270,22 @@ func (c *Cmd) imageConfigs() ([]pkgv1beta1.ImageConfig, error) {
 	return proj.Spec.ImageConfigs, nil
 }
 
+// needsDocker reports whether any input runs its diff server as a container.
+func needsDocker(inputs []diffserver.Input) bool {
+	for _, in := range inputs {
+		if in.Runtime != diffserver.RuntimeDevelopment {
+			return true
+		}
+	}
+	return false
+}
+
 // loadProviderInputs reads Provider manifests and turns them into diff server
-// inputs: the package image from spec.package, and per-provider Docker
-// overrides from the simulate.crossplane.io runtime annotations.
+// inputs per their simulate.crossplane.io runtime annotations: the package
+// image from spec.package with per-provider Docker overrides, or, for the
+// Development runtime, the target of an already running server and the API
+// groups it serves. A group can route to only one development server, so
+// manifests that declare the same group are rejected up front.
 func loadProviderInputs(path string) ([]diffserver.Input, error) {
 	loader, err := load.NewLoader(path)
 	if err != nil {
@@ -257,36 +297,96 @@ func loadProviderInputs(path string) ([]diffserver.Input, error) {
 	}
 
 	inputs := make([]diffserver.Input, 0, len(objs))
+	declared := map[string]string{} // API group -> the Development provider declaring it
 	for _, o := range objs {
 		if o.GetKind() != "Provider" {
 			return nil, errors.Errorf("expected only Provider manifests, found %s", o.GetKind())
 		}
-		in := diffserver.Input{}
-		if in.Image, _, _ = unstructured.NestedString(o.Object, "spec", "package"); in.Image == "" {
-			return nil, errors.Errorf("provider %q has no spec.package", o.GetName())
+		in, err := providerInput(o)
+		if err != nil {
+			return nil, err
 		}
-		annotations := o.GetAnnotations()
-		if v := annotations[AnnotationKeyDockerPublishAddress]; v != "" {
-			if in.PublishAddress, err = netip.ParseAddr(v); err != nil {
-				return nil, errors.Wrapf(err, "provider %q has an invalid %s annotation", o.GetName(), AnnotationKeyDockerPublishAddress)
+		for _, g := range in.APIGroups {
+			if other, ok := declared[g]; ok {
+				return nil, errors.Errorf("providers %q and %q both declare the API group %q in their %s annotation: a group can route to only one development diff server",
+					other, o.GetName(), g, AnnotationKeyDevelopmentAPIGroups)
 			}
-		}
-		in.Target = annotations[AnnotationKeyDockerTarget]
-		switch cleanup := diffserver.Cleanup(annotations[AnnotationKeyDockerCleanup]); cleanup {
-		case diffserver.CleanupRemove, diffserver.CleanupOrphan, "":
-			in.Cleanup = cleanup
-		case containerruntime.CleanupStop:
-			// Render's Stop policy is deliberately unsupported: a stopped
-			// diff server serves nothing, and restarting one costs nearly as
-			// much as starting it.
-			fallthrough
-		default:
-			return nil, errors.Errorf("provider %q has an invalid %s annotation %q: must be %s or %s",
-				o.GetName(), AnnotationKeyDockerCleanup, cleanup, diffserver.CleanupRemove, diffserver.CleanupOrphan)
+			declared[g] = o.GetName()
 		}
 		inputs = append(inputs, in)
 	}
 	return inputs, nil
+}
+
+// providerInput turns one Provider manifest into a diff server input per its
+// runtime annotation.
+func providerInput(o *unstructured.Unstructured) (diffserver.Input, error) {
+	switch r := diffserver.Runtime(o.GetAnnotations()[AnnotationKeyRuntime]); r {
+	case diffserver.RuntimeDocker, "":
+		return dockerInput(o)
+	case diffserver.RuntimeDevelopment:
+		return developmentInput(o)
+	default:
+		return diffserver.Input{}, errors.Errorf("provider %q has an unsupported %s annotation value %q: must be %s or %s",
+			o.GetName(), AnnotationKeyRuntime, r, diffserver.RuntimeDocker, diffserver.RuntimeDevelopment)
+	}
+}
+
+// dockerInput reads a provider whose package image runs as a container: the
+// image from spec.package and the Docker overrides from its annotations.
+func dockerInput(o *unstructured.Unstructured) (diffserver.Input, error) {
+	in := diffserver.Input{}
+	if in.Image, _, _ = unstructured.NestedString(o.Object, "spec", "package"); in.Image == "" {
+		return diffserver.Input{}, errors.Errorf("provider %q has no spec.package", o.GetName())
+	}
+	annotations := o.GetAnnotations()
+	if v := annotations[AnnotationKeyDockerPublishAddress]; v != "" {
+		addr, err := netip.ParseAddr(v)
+		if err != nil {
+			return diffserver.Input{}, errors.Wrapf(err, "provider %q has an invalid %s annotation", o.GetName(), AnnotationKeyDockerPublishAddress)
+		}
+		in.PublishAddress = addr
+	}
+	in.Target = annotations[AnnotationKeyDockerTarget]
+	switch cleanup := diffserver.Cleanup(annotations[AnnotationKeyDockerCleanup]); cleanup {
+	case diffserver.CleanupRemove, diffserver.CleanupOrphan, "":
+		in.Cleanup = cleanup
+	case containerruntime.CleanupStop:
+		// Render's Stop policy is deliberately unsupported: a stopped
+		// diff server serves nothing, and restarting one costs nearly as
+		// much as starting it.
+		fallthrough
+	default:
+		return diffserver.Input{}, errors.Errorf("provider %q has an invalid %s annotation %q: must be %s or %s",
+			o.GetName(), AnnotationKeyDockerCleanup, cleanup, diffserver.CleanupRemove, diffserver.CleanupOrphan)
+	}
+	return in, nil
+}
+
+// developmentInput reads a provider whose diff server the user already runs.
+// Nothing is fetched and nothing starts for it, so spec.package is not
+// needed and the Docker annotations are ignored, the way render ignores them
+// on a Development function. The served API groups must be declared instead.
+func developmentInput(o *unstructured.Unstructured) (diffserver.Input, error) {
+	annotations := o.GetAnnotations()
+	in := diffserver.Input{
+		Runtime:           diffserver.RuntimeDevelopment,
+		Name:              o.GetName(),
+		DevelopmentTarget: defaultDevelopmentTarget,
+	}
+	if t := annotations[AnnotationKeyDevelopmentTarget]; t != "" {
+		in.DevelopmentTarget = t
+	}
+	for g := range strings.SplitSeq(annotations[AnnotationKeyDevelopmentAPIGroups], ",") {
+		if g = strings.TrimSpace(g); g != "" {
+			in.APIGroups = append(in.APIGroups, g)
+		}
+	}
+	if len(in.APIGroups) == 0 {
+		return diffserver.Input{}, errors.Errorf("provider %q uses the Development runtime but declares no API groups: set its %s annotation to the comma-separated groups its diff server serves, for example ec2.aws.upbound.io,ec2.aws.m.upbound.io",
+			o.GetName(), AnnotationKeyDevelopmentAPIGroups)
+	}
+	return in, nil
 }
 
 // loadImageConfigs reads ImageConfig manifests from a YAML file.

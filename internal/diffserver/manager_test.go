@@ -368,4 +368,115 @@ func TestManagerStart(t *testing.T) {
 			t.Errorf("Start(...): want the unready container cleaned up, got removes %v", fd.removed)
 		}
 	})
+
+	t.Run("DevelopmentRoutesDeclaredGroupsWithoutDocker", func(t *testing.T) {
+		// An empty package client and a Docker fake with nothing published:
+		// a fetch or a container start would surface as a skip.
+		fd := newFakeDocker("", nil)
+		m := NewManager(&fakePkgClient{}, log, WithDockerClient(fd.client()))
+
+		in := Input{
+			Runtime:           RuntimeDevelopment,
+			Name:              "provider-aws-ec2",
+			DevelopmentTarget: servePlanService(t),
+			APIGroups:         []string{"ec2.aws.upbound.io", "ec2.aws.m.upbound.io"},
+		}
+		skipped, err := m.Start(ctx, []Input{in}, nil)
+		if err != nil {
+			t.Fatalf("Start(...): unexpected error: %v", err)
+		}
+		if len(skipped) != 0 {
+			t.Fatalf("Start(...): unexpected skips: %+v", skipped)
+		}
+
+		for _, gk := range []schema.GroupKind{
+			{Group: "ec2.aws.upbound.io", Kind: "VPC"},
+			{Group: "ec2.aws.m.upbound.io", Kind: "Subnet"},
+		} {
+			if _, ok := m.Route(gk); !ok {
+				t.Errorf("Route(%s): want a route from the declared API groups", gk)
+			}
+		}
+		if _, ok := m.Route(schema.GroupKind{Group: "s3.aws.upbound.io", Kind: "Bucket"}); ok {
+			t.Errorf("Route(Bucket.s3): want no route for a group the provider did not declare")
+		}
+		if len(fd.created) != 0 {
+			t.Errorf("Start(...): a development diff server must not start a container, got %v", fd.created)
+		}
+
+		if err := m.Stop(ctx); err != nil {
+			t.Fatalf("Stop(...): unexpected error: %v", err)
+		}
+		if len(fd.stopped) != 0 || len(fd.removed) != 0 {
+			t.Errorf("Stop(...): nothing to clean up for a development diff server, got stops %v removes %v", fd.stopped, fd.removed)
+		}
+	})
+
+	t.Run("PackageRoutesWinOverDeclaredGroups", func(t *testing.T) {
+		fd := newFakeDocker(servePlanService(t), nil)
+		m := NewManager(pkgs, log, WithDockerClient(fd.client()))
+
+		const pkgImage, devName = "xpkg.example.org/provider-aws-ec2:v2.9.0", "provider-aws-ec2-dev"
+		dev := Input{
+			Runtime:           RuntimeDevelopment,
+			Name:              devName,
+			DevelopmentTarget: servePlanService(t),
+			APIGroups:         []string{"ec2.aws.upbound.io"},
+		}
+		skipped, err := m.Start(ctx, []Input{{Image: pkgImage}, dev}, nil)
+		if err != nil || len(skipped) != 0 {
+			t.Fatalf("Start(...): unexpected error or skips: %v %+v", err, skipped)
+		}
+
+		clients := map[string]diffv1alpha1.PlanServiceClient{}
+		for _, s := range m.Servers() {
+			clients[s.Image] = s.client
+		}
+
+		// The package ships a CRD for VPC, so its server serves VPC even
+		// though the development server declared the whole group. Subnet
+		// ships in no package, so the declared group routes it.
+		if c, ok := m.Route(schema.GroupKind{Group: "ec2.aws.upbound.io", Kind: "VPC"}); !ok || c != clients[pkgImage] {
+			t.Errorf("Route(VPC.ec2): want the package-run server, got %v (ok %t)", c, ok)
+		}
+		if c, ok := m.Route(schema.GroupKind{Group: "ec2.aws.upbound.io", Kind: "Subnet"}); !ok || c != clients[devName] {
+			t.Errorf("Route(Subnet.ec2): want the development server, got %v (ok %t)", c, ok)
+		}
+
+		if err := m.Stop(ctx); err != nil {
+			t.Fatalf("Stop(...): unexpected error: %v", err)
+		}
+		if len(fd.removed) != 1 {
+			t.Errorf("Stop(...): want only the package-run container removed, got %v", fd.removed)
+		}
+	})
+
+	t.Run("DevelopmentTargetNotReadySkips", func(t *testing.T) {
+		// A listener that accepts no gRPC: readiness never succeeds. No
+		// Docker client at all: a development provider never needs one.
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("cannot listen: %v", err)
+		}
+		t.Cleanup(func() { _ = lis.Close() })
+
+		m := NewManager(&fakePkgClient{}, log, WithReadyTimeout(700*time.Millisecond))
+
+		target := lis.Addr().String()
+		skipped, err := m.Start(ctx, []Input{{
+			Runtime:           RuntimeDevelopment,
+			Name:              "provider-aws-ec2",
+			DevelopmentTarget: target,
+			APIGroups:         []string{"ec2.aws.upbound.io"},
+		}}, nil)
+		if err != nil {
+			t.Fatalf("Start(...): unexpected error: %v", err)
+		}
+		if len(skipped) != 1 || !strings.Contains(skipped[0].Reason, target) {
+			t.Errorf("Start(...): want a skip naming the unreachable target %s, got %+v", target, skipped)
+		}
+		if _, ok := m.Route(schema.GroupKind{Group: "ec2.aws.upbound.io", Kind: "VPC"}); ok {
+			t.Errorf("Route(VPC.ec2): want no route from a skipped development server")
+		}
+	})
 }

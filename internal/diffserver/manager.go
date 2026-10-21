@@ -19,6 +19,9 @@ limitations under the License.
 // function packages. Whether a package can serve diffs is declared in its
 // metadata (the DiffServer capability), and which resources it serves comes
 // from the CRDs it ships, so everything is known before a container starts.
+// A provider can instead point at a diff server already running outside
+// Docker (the Development runtime, like render's); nothing is fetched for it,
+// so the provider declares the API groups its server serves.
 package diffserver
 
 import (
@@ -81,6 +84,21 @@ const (
 	CleanupOrphan = containerruntime.CleanupOrphan
 )
 
+// Runtime is how a provider's diff server is run, following render's
+// per-function runtime annotation.
+type Runtime string
+
+const (
+	// RuntimeDocker runs the provider's package image as a local container.
+	// It is the default.
+	RuntimeDocker Runtime = "Docker"
+
+	// RuntimeDevelopment connects to a diff server the user runs themselves,
+	// from source or under a debugger. No package is fetched and no
+	// container starts, so the provider declares the API groups it serves.
+	RuntimeDevelopment Runtime = "Development"
+)
+
 // labelDomain prefixes the labels simulate applies to the Docker containers
 // it creates.
 const labelDomain = "simulate.crossplane.io"
@@ -106,40 +124,62 @@ const (
 	LabelKeyCleanup = labelDomain + "/cleanup"
 )
 
-// Server is a running diff server for one provider package.
+// Server is a running diff server for one provider.
 type Server struct {
-	Image       string
-	Address     string
+	// Image identifies the provider: its package image, or the manifest
+	// name of a Development provider, which has no image to run.
+	Image   string
+	Address string
+	// ContainerID is empty for a Development provider: its server runs
+	// outside Docker.
 	ContainerID string
-	GroupKinds  []schema.GroupKind
+	// GroupKinds are the kinds the provider's package ships CRDs for.
+	GroupKinds []schema.GroupKind
+	// APIGroups are the groups a Development provider declared it serves.
+	APIGroups []string
 
-	conn    *grpc.ClientConn
-	client  diffv1alpha1.PlanServiceClient
-	running *containerruntime.Running
-	cleanup Cleanup
+	conn   *grpc.ClientConn
+	client diffv1alpha1.PlanServiceClient
+	// stop tears down whatever Start created. Nil when nothing was created.
+	stop func(context.Context) error
 }
 
-// Skipped records a provider image that does not run a diff server this run,
-// and why. Resources it would have served fall back to the approximate
-// client-side diff.
+// Skipped records a provider that does not run a diff server this run, and
+// why. Resources it would have served fall back to the approximate
+// client-side diff. Image identifies the provider the way Server.Image does.
 type Skipped struct {
 	Image  string
 	Reason string
 }
 
-// Input describes one provider package to run as a diff server. The zero
-// values mean the manager's defaults apply; set them to override Docker
+// Input describes one provider to run, or connect to, as a diff server. The
+// zero values mean the manager's defaults apply; set them to override Docker
 // behavior for this provider only, the way render's per-function runtime
 // annotations do.
 type Input struct {
+	// Image is the provider package to run. A Development provider needs
+	// none: its server is already running.
 	Image          string
 	PublishAddress netip.Addr
 	Target         string
 	Cleanup        Cleanup
+
+	// Runtime selects how the diff server is run. Empty means Docker.
+	Runtime Runtime
+	// Name identifies the provider in progress and skip messages when there
+	// is no image to name it by, e.g. the Provider manifest's name.
+	Name string
+	// DevelopmentTarget is the gRPC target of a Development provider's
+	// running diff server.
+	DevelopmentTarget string
+	// APIGroups are the API groups a Development provider serves. Resources
+	// in these groups route to it unless a package-run server ships a CRD
+	// for their exact group and kind.
+	APIGroups []string
 }
 
-// Manager starts diff server containers for provider packages and routes
-// resources to them.
+// Manager starts diff server containers for provider packages, connects to
+// diff servers run outside Docker, and routes resources to them.
 type Manager struct {
 	pkgs         runtimexpkg.Client
 	cli          containerruntime.Client
@@ -150,6 +190,7 @@ type Manager struct {
 
 	mu      sync.Mutex
 	routes  map[schema.GroupKind]*Server
+	groups  map[string]*Server
 	servers []*Server
 }
 
@@ -184,6 +225,7 @@ func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Ma
 		readyTimeout: defaultReadyTimeout,
 		publishAddr:  netip.MustParseAddr("127.0.0.1"),
 		routes:       map[schema.GroupKind]*Server{},
+		groups:       map[string]*Server{},
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -192,12 +234,14 @@ func NewManager(pkgs runtimexpkg.Client, log logging.Logger, opts ...Option) *Ma
 }
 
 // Start inspects each provider image and runs a diff server container for
-// every package that declares the DiffServer capability, in parallel and best
-// effort: an image that cannot serve (no capability, fetch or startup
-// failure) is returned as skipped rather than failing the run, since its
-// resources degrade to the approximate client-side diff. Progress is reported
-// per image on events (nil means no reporting), with the package pull and the
-// server start as separate steps because the pull dominates a cold start.
+// every package that declares the DiffServer capability, and connects to the
+// already running server of every Development provider, in parallel and best
+// effort: a provider that cannot serve (no capability, fetch or startup
+// failure, nothing answering at a development target) is returned as skipped
+// rather than failing the run, since its resources degrade to the approximate
+// client-side diff. Progress is reported per provider on events (nil means no
+// reporting), with the package pull and the server start as separate steps
+// because the pull dominates a cold start.
 func (m *Manager) Start(ctx context.Context, inputs []Input, events async.EventChannel) ([]Skipped, error) {
 	var (
 		wg      sync.WaitGroup
@@ -244,9 +288,21 @@ func (m *Manager) register(s *Server) {
 		}
 		m.routes[gk] = s
 	}
+	for _, g := range s.APIGroups {
+		if other, ok := m.groups[g]; ok {
+			m.log.Info("Multiple development diff servers declare the same API group; keeping the first",
+				"group", g, "kept", other.Image, "ignored", s.Image)
+			continue
+		}
+		m.groups[g] = s
+	}
 }
 
 func (m *Manager) startOne(ctx context.Context, in Input, events async.EventChannel) (*Server, *Skipped) {
+	if in.Runtime == RuntimeDevelopment {
+		return m.connectDevelopment(ctx, in, events)
+	}
+
 	image := in.Image
 
 	// The package pull is its own reported step: on a cold cache it downloads
@@ -316,7 +372,7 @@ func (m *Manager) startOne(ctx context.Context, in Input, events async.EventChan
 		return nil, &Skipped{Image: image, Reason: fmt.Sprintf("cannot start diff server container: %s", err)}
 	}
 
-	server, err := m.connect(ctx, running, image)
+	server, err := m.connect(ctx, running, image, cleanup)
 	if err != nil {
 		events.SendEvent(start, async.EventStatusFailure)
 		// An orphaned container is left behind even on failure, for debugging.
@@ -330,20 +386,41 @@ func (m *Manager) startOne(ctx context.Context, in Input, events async.EventChan
 	events.SendEvent(start, async.EventStatusSuccess)
 
 	server.GroupKinds = gks
-	server.cleanup = cleanup
 	m.log.Debug("Diff server ready", "image", image, "address", server.Address, "reused", running.Reused, "cleanup", cleanup)
 	return server, nil
 }
 
-func (m *Manager) connect(ctx context.Context, running *containerruntime.Running, image string) (*Server, error) {
-	conn, err := grpc.NewClient(running.Addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, errors.Wrap(err, "cannot create gRPC client")
+// connectDevelopment connects to a diff server the user already runs, from
+// source or under a debugger. Nothing is fetched and nothing starts, so the
+// routes come from the API groups the provider declared.
+func (m *Manager) connectDevelopment(ctx context.Context, in Input, events async.EventChannel) (*Server, *Skipped) {
+	name := in.Name
+	if name == "" {
+		name = in.Image
 	}
 
-	client := diffv1alpha1.NewPlanServiceClient(conn)
-	if err := waitReady(ctx, client, m.readyTimeout); err != nil {
-		_ = conn.Close()
+	step := fmt.Sprintf("Connecting to diff server for %s at %s", name, in.DevelopmentTarget)
+	events.SendEvent(step, async.EventStatusStarted)
+	conn, client, err := m.dial(ctx, in.DevelopmentTarget)
+	if err != nil {
+		events.SendEvent(step, async.EventStatusFailure)
+		return nil, &Skipped{Image: name, Reason: fmt.Sprintf("no diff server answered at %s; start the provider's internal diff-server command before simulating: %s", in.DevelopmentTarget, err)}
+	}
+	events.SendEvent(step, async.EventStatusSuccess)
+
+	m.log.Debug("Development diff server ready", "provider", name, "target", in.DevelopmentTarget, "apiGroups", in.APIGroups)
+	return &Server{
+		Image:     name,
+		Address:   in.DevelopmentTarget,
+		APIGroups: in.APIGroups,
+		conn:      conn,
+		client:    client,
+	}, nil
+}
+
+func (m *Manager) connect(ctx context.Context, running *containerruntime.Running, image string, cleanup Cleanup) (*Server, error) {
+	conn, client, err := m.dial(ctx, running.Addr)
+	if err != nil {
 		return nil, err
 	}
 
@@ -353,8 +430,23 @@ func (m *Manager) connect(ctx context.Context, running *containerruntime.Running
 		ContainerID: running.ID,
 		conn:        conn,
 		client:      client,
-		running:     running,
+		stop:        func(ctx context.Context) error { return running.Stop(ctx, cleanup) },
 	}, nil
+}
+
+// dial connects to the diff server at target and waits for it to answer.
+func (m *Manager) dial(ctx context.Context, target string) (*grpc.ClientConn, diffv1alpha1.PlanServiceClient, error) {
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "cannot create gRPC client")
+	}
+
+	client := diffv1alpha1.NewPlanServiceClient(conn)
+	if err := waitReady(ctx, client, m.readyTimeout); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, client, nil
 }
 
 // waitReady polls the server with an empty Plan request until it answers.
@@ -386,15 +478,18 @@ func waitReady(ctx context.Context, c diffv1alpha1.PlanServiceClient, timeout ti
 }
 
 // Route returns the diff server client that serves the given group and kind,
-// if any.
+// if any. A package-run server that ships a CRD for the exact group and kind
+// wins over a development server that declared the group.
 func (m *Manager) Route(gk schema.GroupKind) (diffv1alpha1.PlanServiceClient, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s, ok := m.routes[gk]
-	if !ok {
-		return nil, false
+	if s, ok := m.routes[gk]; ok {
+		return s.client, true
 	}
-	return s.client, true
+	if s, ok := m.groups[gk.Group]; ok {
+		return s.client, true
+	}
+	return nil, false
 }
 
 // Servers returns the running diff servers.
@@ -406,7 +501,8 @@ func (m *Manager) Servers() []*Server {
 
 // Stop closes connections and tears down containers according to each
 // server's cleanup policy: Remove tears the container down, Orphan leaves it
-// running so the next run finds it by name and skips startup.
+// running so the next run finds it by name and skips startup. A development
+// server is the user's to stop, so only its connection is closed.
 func (m *Manager) Stop(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -416,7 +512,10 @@ func (m *Manager) Stop(ctx context.Context) error {
 		if s.conn != nil {
 			_ = s.conn.Close()
 		}
-		if err := s.running.Stop(ctx, s.cleanup); err != nil {
+		if s.stop == nil {
+			continue
+		}
+		if err := s.stop(ctx); err != nil {
 			errs = append(errs, errors.Wrapf(err, "cannot stop diff server container %s", s.ContainerID))
 		}
 	}
