@@ -131,7 +131,12 @@ Manifests rather than bare image references, so the override can be
 checked in and shared, and so per-provider runtime configuration has a
 carrier: the `simulate.crossplane.io/runtime-docker-*` annotations mirror
 render's per-function runtime annotations for the Docker setups where the
-published port is not reachable on the address the daemon reports.
+published port is not reachable on the address the daemon reports, and
+`simulate.crossplane.io/runtime: Development` mirrors render's Development
+runtime for a diff server the developer runs outside Docker. Nothing is
+fetched for such a provider, so its manifest declares the API groups the
+server serves and those groups route to it unless a package ships a CRD for
+the exact kind.
 
 ### Previewing a Provider Upgrade
 
