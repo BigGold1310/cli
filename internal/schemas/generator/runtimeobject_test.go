@@ -22,6 +22,8 @@ import (
 	"go/token"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 // roMethods parses src and returns the set of "recv.method" names declared.
@@ -200,7 +202,7 @@ type Foo struct {
 	}
 }
 
-func TestObjectMetaAccessors(t *testing.T) {
+func TestRootMetaAccessors(t *testing.T) {
 	const src = `package v1alpha1
 
 type FooAPIVersion string
@@ -228,87 +230,81 @@ type FooList struct {
 }
 `
 
-	code, _, err := addRuntimeObjects(src)
-	if err != nil {
-		t.Fatalf("addRuntimeObjects: %v", err)
+	type want struct {
+		// methods maps "Recv.Method" to whether it must be declared.
+		methods  map[string]bool
+		contains []string
+	}
+	cases := []struct {
+		name   string
+		args   string
+		want   want
+		reason string
+	}{
+		{
+			name: "ObjectMetaRoot",
+			args: src,
+			want: want{
+				methods: map[string]bool{
+					"Foo.GetName": true, "Foo.SetName": true,
+					"Foo.GetNamespace": true, "Foo.SetNamespace": true,
+					"Foo.GetUID": true, "Foo.SetUID": true,
+					"Foo.GetLabels": true, "Foo.SetLabels": true,
+					"Foo.GetOwnerReferences": true, "Foo.SetOwnerReferences": true,
+					"Foo.GetManagedFields": true, "Foo.SetManagedFields": true,
+					// A ListMeta-shaped root must not get ObjectMeta's methods.
+					"FooList.GetName": false, "FooList.SetName": false,
+					"FooList.GetLabels": false,
+				},
+				contains: []string{
+					"k8stypes.UID",
+					`k8stypes "k8s.io/apimachinery/pkg/types"`,
+				},
+			},
+			reason: "an ObjectMeta-shaped root must get the metav1.Object accessors, with GetUID returning k8stypes.UID, and a ListMeta-shaped root must not",
+		},
+		{
+			name: "ListMetaRoot",
+			args: src,
+			want: want{
+				methods: map[string]bool{
+					"FooList.GetResourceVersion": true, "FooList.SetResourceVersion": true,
+					"FooList.GetContinue": true, "FooList.SetContinue": true,
+					"FooList.GetRemainingItemCount": true, "FooList.SetRemainingItemCount": true,
+					// An ObjectMeta-shaped root must not get ListInterface's methods.
+					"Foo.GetContinue": false,
+				},
+			},
+			reason: "a ListMeta-shaped root must get the metav1.ListInterface accessors, and an ObjectMeta-shaped root must not",
+		},
 	}
 
-	methods := roMethods(t, code)
-	for _, m := range []string{
-		"Foo.GetName", "Foo.SetName",
-		"Foo.GetNamespace", "Foo.SetNamespace",
-		"Foo.GetUID", "Foo.SetUID",
-		"Foo.GetLabels", "Foo.SetLabels",
-		"Foo.GetOwnerReferences", "Foo.SetOwnerReferences",
-		"Foo.GetManagedFields", "Foo.SetManagedFields",
-	} {
-		if !methods[m] {
-			t.Errorf("expected %s to be generated for an ObjectMeta-shaped root", m)
-		}
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, _, err := addRuntimeObjects(tc.args)
+			if err != nil {
+				t.Fatalf("addRuntimeObjects: %v", err)
+			}
 
-	// A ListMeta-shaped root must not get ObjectMeta's methods.
-	for _, m := range []string{"FooList.GetName", "FooList.SetName", "FooList.GetLabels"} {
-		if methods[m] {
-			t.Errorf("did not expect %s on a ListMeta-shaped root", m)
-		}
-	}
+			declared := roMethods(t, code)
+			got := make(map[string]bool, len(tc.want.methods))
+			for m := range tc.want.methods {
+				got[m] = declared[m]
+			}
+			if diff := cmp.Diff(tc.want.methods, got); diff != "" {
+				t.Errorf("%s\nmethods declared (-want +got):\n%s", tc.reason, diff)
+			}
 
-	if !strings.Contains(code, "k8stypes.UID") {
-		t.Errorf("expected GetUID to return k8stypes.UID, got:\n%s", code)
-	}
-	if !strings.Contains(code, `k8stypes "k8s.io/apimachinery/pkg/types"`) {
-		t.Errorf("expected k8stypes import, got:\n%s", code)
-	}
-}
-
-func TestListInterfaceAccessors(t *testing.T) {
-	const src = `package v1alpha1
-
-type FooAPIVersion string
-type FooKind string
-
-type ObjectMeta struct {
-	Name *string ` + "`json:\"name,omitempty\"`" + `
-}
-
-type ListMeta struct {
-	ResourceVersion *string ` + "`json:\"resourceVersion,omitempty\"`" + `
-}
-
-type Foo struct {
-	APIVersion *FooAPIVersion ` + "`json:\"apiVersion,omitempty\"`" + `
-	Kind       *FooKind       ` + "`json:\"kind,omitempty\"`" + `
-	Metadata   *ObjectMeta    ` + "`json:\"metadata,omitempty\"`" + `
-}
-
-type FooList struct {
-	APIVersion *FooAPIVersion ` + "`json:\"apiVersion,omitempty\"`" + `
-	Kind       *FooKind       ` + "`json:\"kind,omitempty\"`" + `
-	Metadata   *ListMeta      ` + "`json:\"metadata,omitempty\"`" + `
-	Items      *[]Foo         ` + "`json:\"items,omitempty\"`" + `
-}
-`
-
-	code, _, err := addRuntimeObjects(src)
-	if err != nil {
-		t.Fatalf("addRuntimeObjects: %v", err)
-	}
-
-	methods := roMethods(t, code)
-	for _, m := range []string{
-		"FooList.GetResourceVersion", "FooList.SetResourceVersion",
-		"FooList.GetContinue", "FooList.SetContinue",
-		"FooList.GetRemainingItemCount", "FooList.SetRemainingItemCount",
-	} {
-		if !methods[m] {
-			t.Errorf("expected %s to be generated for a ListMeta-shaped root", m)
-		}
-	}
-
-	// An ObjectMeta-shaped root must not get ListInterface's methods.
-	if methods["Foo.GetContinue"] {
-		t.Error("did not expect Foo.GetContinue on an ObjectMeta-shaped root")
+			var missing []string
+			for _, frag := range tc.want.contains {
+				if !strings.Contains(code, frag) {
+					missing = append(missing, frag)
+				}
+			}
+			if diff := cmp.Diff([]string(nil), missing); diff != "" {
+				t.Errorf("%s\nfragments missing from generated code (-want +got):\n%s\n%s", tc.reason, diff, code)
+			}
+		})
 	}
 }
 

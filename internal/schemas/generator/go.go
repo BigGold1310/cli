@@ -1076,6 +1076,7 @@ func fixMissingImports(code string) (string, error) {
 	k8sImports := map[string]string{
 		"metacorev1":    "dev.crossplane.io/models/io/k8s/core/meta/v1",
 		"metav1":        "dev.crossplane.io/models/io/k8s/meta/v1",
+		"k8smetav1":     "k8s.io/apimachinery/pkg/apis/meta/v1",
 		"corev1":        "dev.crossplane.io/models/io/k8s/core/v1",
 		"resourcev1":    "dev.crossplane.io/models/io/k8s/resource/v1",
 		"runtimev1":     "dev.crossplane.io/models/io/k8s/runtime/v1",

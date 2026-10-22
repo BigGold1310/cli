@@ -51,9 +51,9 @@ to a `meta/v1` type, including `Time`, `OwnerReference`, `LabelSelector`,
 `k8s.io/apimachinery` package instead. Code that imports the mirror package
 directly won't build after you turn this flag on.
 
-This flag was off by default and wasn't usable as a `client.Object` before
-this change, so we don't provide a migration path. Regenerate your models
-after upgrading. The schema manager skips regeneration when your
+This flag is off by default. Before this change, the generated types didn't
+work as `client.Object` values, so we don't provide a migration path.
+Regenerate your models after upgrading. The schema manager skips regeneration when your
 dependency's version hasn't changed, so run
 `crossplane dependency clean-cache` first if regenerating doesn't pick up
 the new output.
